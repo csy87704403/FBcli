@@ -1,0 +1,7 @@
+freebuff-*-linux-*
+*.tar.gz
+*.exe
+.env
+data/
+accounts/
+freebuff-cli-gateway-state.json*

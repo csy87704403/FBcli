@@ -1,0 +1,34 @@
+[Unit]
+Description=Freebuff CLI Gateway
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=freebuff-gateway
+Group=freebuff-gateway
+EnvironmentFile=/etc/freebuff-gateway/gateway.env
+Environment=HOME=/var/lib/freebuff-gateway
+Environment=TMPDIR=/var/lib/freebuff-gateway/tmp
+WorkingDirectory=/var/lib/freebuff-gateway/work
+ExecStart=/opt/freebuff-gateway/freebuff-gateway \
+  -listen ${FREEBUFF_API_LISTEN} \
+  -admin-listen ${FREEBUFF_ADMIN_LISTEN} \
+  -cli /opt/freebuff-gateway/freebuff-headless \
+  -login-cli /opt/freebuff-gateway/freebuff-login \
+  -cwd /var/lib/freebuff-gateway/work \
+  -state /var/lib/freebuff-gateway/freebuff-cli-gateway-state.json \
+  -accounts-root /var/lib/freebuff-gateway/accounts \
+  -default-account-config /var/lib/freebuff-gateway/default-account
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+LimitNOFILE=65535
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/freebuff-gateway
+
+[Install]
+WantedBy=multi-user.target

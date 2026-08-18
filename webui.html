@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Freebuff CLI Gateway</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#0d1117;color:#c9d1d9;font:14px system-ui}.wrap{max-width:1120px;margin:auto;padding:16px}h1{font-size:19px;color:#58a6ff}h2{font-size:15px;color:#8b949e;margin:0 0 10px}.nav{display:flex;gap:5px;border-bottom:1px solid #30363d;padding-bottom:8px;margin-bottom:14px}.nav button,.btn{border:0;border-radius:6px;padding:7px 12px;background:#238636;color:#fff;cursor:pointer}.nav button{background:transparent;color:#8b949e}.nav button.active{background:#1f6feb33;color:#58a6ff}.btn.blue{background:#1f6feb}.btn.red{background:#da3633}.btn.gray{background:#30363d}.page{display:none}.page.active{display:block}.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:13px;margin-bottom:12px}.metrics,.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.metric{background:#21262d;border-radius:7px;padding:9px 12px;min-width:130px;flex:1}.metric b{display:block;font-size:19px;color:#58a6ff}.muted{color:#8b949e;font-size:12px}.grow{flex:1}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:7px;border-bottom:1px solid #21262d;vertical-align:top}th{color:#8b949e;font-weight:500}input,textarea,select{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:8px}input,textarea{width:100%}textarea{min-height:100px}.badge{display:inline-block;border-radius:12px;padding:2px 8px;font-size:11px}.ok{background:#23863633;color:#3fb950}.warn{background:#d2992233;color:#e3b341}.bad{background:#da363333;color:#f85149}code{background:#21262d;padding:3px 7px;border-radius:4px;word-break:break-all}#flash{position:fixed;right:15px;top:15px;padding:9px 15px;border-radius:7px;background:#238636;color:#fff;display:none}#flash.bad{background:#da3633;color:#fff}@media(max-width:700px){.wrap{padding:9px}.nav{overflow:auto}table{font-size:12px}.hide-mobile{display:none}}
+</style>
+</head>
+<body><div class="wrap">
+<div class="row"><h1 class="grow">⚡ Freebuff CLI Gateway</h1><button class="btn gray" onclick="logoutAdmin()">退出登录</button></div>
+<div class="nav"><button data-page="accounts" class="active">账号</button><button data-page="apis">API Keys</button><button data-page="usage">用量</button><button data-page="ips">IP 池</button></div>
+
+<section class="page active" id="page-accounts">
+ <div class="metrics" id="metrics"></div>
+ <div class="card"><div class="row"><h2 class="grow">官方 CLI 账号实例</h2><button class="btn blue" onclick="startAccountLogin()">添加账号</button><button class="btn gray" onclick="loadAccounts()">刷新</button></div>
+  <p class="muted">账号认证由官方 CLI 管理；本页不会读取或调用旧网关 Token。</p>
+  <div id="login-panel" class="card" style="display:none;margin-top:10px"></div>
+  <div style="overflow:auto"><table><thead><tr><th>账号</th><th>状态</th><th>CLI 状态</th><th>当前出口</th><th>会话/请求</th><th>模型数</th><th>最后错误</th><th>操作</th></tr></thead><tbody id="accounts-body"></tbody></table></div>
+ </div>
+ <div class="card"><div class="row"><h2 class="grow">账号迁移配置</h2><button class="btn gray" onclick="loadAccountConfig(true)">重新读取</button><button class="btn gray" onclick="copyAccountConfig()">复制配置</button><button class="btn blue" onclick="saveAccountConfig()">保存配置</button></div>
+  <p class="bad" style="padding:8px;border-radius:6px">敏感信息：下方 JSON 包含所有账号的完整 authToken。只复制到你自己控制的 VPS，不要截图、分享或提交 GitHub。</p>
+  <textarea id="account-config-json" spellcheck="false" autocomplete="off" style="min-height:280px;font-family:ui-monospace,Consolas,monospace" placeholder="当前账号迁移 JSON 将显示在这里；也可以粘贴其他服务器导出的配置后保存。"></textarea>
+  <p class="muted">保存时按邮箱合并；不会删除 JSON 中未出现的账号，也不会迁移聊天记录和 Windows 路径。</p>
+ </div>
+</section>
+
+<section class="page" id="page-apis">
+ <div class="card"><h2>接入地址</h2><div class="row"><code class="grow" id="base-url"></code><button class="btn gray" onclick="copyBaseURL()">复制</button></div></div>
+ <div class="card"><div class="row"><h2 class="grow">API Key 列表</h2><button class="btn blue" onclick="createKey()">生成新 Key</button></div>
+  <div class="row"><input id="key-input" class="grow" placeholder="留空自动生成，或输入自定义 Key"><button class="btn" onclick="createKey(true)">添加</button></div>
+  <div style="overflow:auto"><table><thead><tr><th>Key</th><th>操作</th></tr></thead><tbody id="keys-body"></tbody></table></div>
+ </div>
+</section>
+
+<section class="page" id="page-usage">
+ <div class="card"><div class="row"><h2 class="grow">本地用量统计</h2><select id="usage-days" onchange="loadUsage()"><option value="1">今日</option><option value="7">近 7 天</option><option value="30">近 30 天</option></select></div>
+  <p class="muted" id="usage-note"></p><div class="metrics" id="usage-metrics"></div>
+  <div class="row"><div class="grow"><h2>按模型</h2><table><thead><tr><th>模型</th><th>估算 Token</th></tr></thead><tbody id="usage-model"></tbody></table></div><div class="grow"><h2>按 API Key</h2><table><thead><tr><th>API Key</th><th>估算 Token</th></tr></thead><tbody id="usage-key"></tbody></table></div></div>
+ </div>
+</section>
+
+<section class="page" id="page-ips">
+ <div class="card"><div class="row"><h2 class="grow">当前实际出口权限</h2><button class="btn blue" onclick="detectEgressTier()">重新检测</button></div>
+  <div id="egress-tier" class="muted">尚未检测</div>
+  <p class="muted">使用 Freebuff 官方公开接口判定，不发送账号 Token、Cookie，也不会创建对话 Session。该结果只描述当前出口，不用于按地区自动切换节点。</p>
+ </div>
+ <div class="card"><div class="row"><h2 class="grow">出口 IP 池</h2><button class="btn blue" onclick="detectProxies()">检测连通性</button><button class="btn" onclick="saveProxies()">保存列表</button></div>
+  <p class="muted">节点池只检测网络连通性，不按国家或 FULL 权限筛选节点。只有检测在线的节点才能设为出口，切换会重启 CLI 子进程。</p>
+  <textarea id="proxy-input" placeholder="每行一个：http://127.0.0.1:10001 或 socks5://host:port"></textarea>
+  <div style="overflow:auto"><table><thead><tr><th>地址</th><th>连通延迟</th><th>状态</th><th>详情</th><th>操作</th></tr></thead><tbody id="proxy-body"></tbody></table></div>
+ </div>
+</section>
+</div><div id="flash"></div><script src="/webui.js"></script></body></html>

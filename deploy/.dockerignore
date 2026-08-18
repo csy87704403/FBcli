@@ -1,0 +1,5 @@
+*
+!freebuff-gateway-linux-*
+!freebuff-headless-linux-*
+!freebuff-login-linux-*
+!tree-sitter.wasm

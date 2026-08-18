@@ -1,0 +1,14 @@
+diff --git a/cli/src/utils/config-dir.ts b/cli/src/utils/config-dir.ts
+index f8b80bf..bb97bc3 100644
+--- a/cli/src/utils/config-dir.ts
++++ b/cli/src/utils/config-dir.ts
+@@ -12,6 +12,9 @@ import { env } from '@codebuff/common/env'
+  * otherwise create an import cycle.
+  */
+ export const getConfigDir = (): string => {
++  const override = process.env.FREEBUFF_CONFIG_DIR?.trim()
++  if (override) return path.resolve(override)
++
+   return path.join(
+     os.homedir(),
+     '.config',

@@ -1,0 +1,15 @@
+services:
+  freebuff-gateway:
+    build:
+      context: .
+    image: freebuff-cli-gateway:local
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      FREEBUFF_ADMIN_USER: ${FREEBUFF_ADMIN_USER:-admin}
+      FREEBUFF_ADMIN_PASSWORD: ${FREEBUFF_ADMIN_PASSWORD:?请在 .env 中设置后台密码}
+    volumes:
+      - freebuff-data:/var/lib/freebuff-gateway
+
+volumes:
+  freebuff-data:

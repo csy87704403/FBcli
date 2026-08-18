@@ -1,0 +1,254 @@
+package main
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestPortableAccountBundleImportsIntoFreshAccountRoot(t *testing.T) {
+	sourceDir := t.TempDir()
+	sourceAccountDir := filepath.Join(sourceDir, "source-account")
+	writeTestCredential(t, sourceAccountDir, "portable@example.com")
+	sourceStore := &stateStore{path: filepath.Join(sourceDir, "state.json"), state: gatewayState{Accounts: []accountConfig{{
+		ID: "account-portable", Label: "portable@example.com", ConfigDir: sourceAccountDir, Enabled: true, AddedAt: time.Now(),
+	}}}}
+	source := newAccountManager(sourceStore, "headless", "", sourceDir, filepath.Join(sourceDir, "accounts"))
+	bundle, err := source.exportPortableAccounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bundle.Accounts) != 1 || !strings.Contains(string(bundle.Accounts[0].Credentials), `"authToken":"token"`) {
+		t.Fatalf("exported credentials are incomplete: %#v", bundle)
+	}
+
+	targetDir := t.TempDir()
+	targetStore := &stateStore{path: filepath.Join(targetDir, "state.json")}
+	target := newAccountManager(targetStore, "headless", "", targetDir, filepath.Join(targetDir, "accounts"))
+	updated, added, err := target.importPortableAccounts(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated != 1 || added != 1 || len(targetStore.state.Accounts) != 1 {
+		t.Fatalf("unexpected import result: updated=%d added=%d accounts=%d", updated, added, len(targetStore.state.Accounts))
+	}
+	config := targetStore.state.Accounts[0]
+	if filepath.Dir(config.ConfigDir) != filepath.Join(targetDir, "accounts") {
+		t.Fatalf("source machine path was imported: %s", config.ConfigDir)
+	}
+	data, err := os.ReadFile(filepath.Join(config.ConfigDir, "credentials.json"))
+	if err != nil || !json.Valid(data) || !readAccountCredential(config.ConfigDir).Authenticated {
+		t.Fatalf("imported credentials are invalid: %v", err)
+	}
+}
+
+func TestPortableAccountImportRejectsActiveRequests(t *testing.T) {
+	dir := t.TempDir()
+	accountDir := filepath.Join(dir, "one")
+	writeTestCredential(t, accountDir, "one@example.com")
+	store := &stateStore{path: filepath.Join(dir, "state.json"), state: gatewayState{Accounts: []accountConfig{{ID: "account-one", ConfigDir: accountDir, Enabled: true}}}}
+	manager := newAccountManager(store, "headless", "", dir, filepath.Join(dir, "accounts"))
+	manager.runtimes["account-one"].active = 1
+	bundle, err := manager.exportPortableAccounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := manager.importPortableAccounts(bundle); err == nil || !strings.Contains(err.Error(), "requests are active") {
+		t.Fatalf("active import was not rejected: %v", err)
+	}
+}
+
+func writeTestCredential(t *testing.T, dir, email string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	content := `{"default":{"name":"Test","email":"` + email + `","authToken":"token"}}`
+	if err := os.WriteFile(filepath.Join(dir, "credentials.json"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAccountSchedulerBalancesAndPinsSessions(t *testing.T) {
+	dir := t.TempDir()
+	oneDir, twoDir := filepath.Join(dir, "one"), filepath.Join(dir, "two")
+	writeTestCredential(t, oneDir, "one@example.com")
+	writeTestCredential(t, twoDir, "two@example.com")
+	store := &stateStore{path: filepath.Join(dir, "state.json"), state: gatewayState{Accounts: []accountConfig{
+		{ID: "one", ConfigDir: oneDir, Enabled: true},
+		{ID: "two", ConfigDir: twoDir, Enabled: true},
+	}}}
+	manager := newAccountManager(store, "headless", "", dir, filepath.Join(dir, "accounts"))
+
+	_, firstAccount, err := manager.acquire("session-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, secondAccount, err := manager.acquire("session-two")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstAccount == secondAccount {
+		t.Fatalf("two concurrent sessions selected the same account: %s", firstAccount)
+	}
+	manager.finish(firstAccount, nil)
+	manager.finish(secondAccount, nil)
+
+	_, resumedAccount, err := manager.acquire("session-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.finish(resumedAccount, nil)
+	if resumedAccount != firstAccount {
+		t.Fatalf("session moved accounts: got %s, want %s", resumedAccount, firstAccount)
+	}
+}
+
+func TestLimitedAccountEntersCooldown(t *testing.T) {
+	dir := t.TempDir()
+	accountDir := filepath.Join(dir, "one")
+	writeTestCredential(t, accountDir, "one@example.com")
+	store := &stateStore{path: filepath.Join(dir, "state.json"), state: gatewayState{Accounts: []accountConfig{{ID: "one", ConfigDir: accountDir, Enabled: true}}}}
+	manager := newAccountManager(store, "headless", "", dir, filepath.Join(dir, "accounts"))
+	_, accountID, err := manager.acquire("session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.finish(accountID, os.ErrDeadlineExceeded)
+	if !manager.runtimes[accountID].cooldownUntil.IsZero() {
+		t.Fatal("transport error incorrectly cooled down the account")
+	}
+	_, accountID, err = manager.acquire("limited-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.finish(accountID, &testError{"free session rate_limited"})
+	if !manager.runtimes[accountID].cooldownUntil.After(time.Now()) {
+		t.Fatal("rate-limited account did not enter cooldown")
+	}
+}
+
+type testError struct{ message string }
+
+func (e *testError) Error() string { return e.message }
+
+func TestCLIEnvironmentIsolatesConfigDirectory(t *testing.T) {
+	env := cliEnvironment("", `E:\accounts\one`)
+	found := false
+	for _, item := range env {
+		if strings.EqualFold(item, `FREEBUFF_CONFIG_DIR=E:\accounts\one`) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("FREEBUFF_CONFIG_DIR missing from child environment")
+	}
+}
+
+func TestCleanLoginURL(t *testing.T) {
+	line := "\x1b[36mhttps://freebuff.com/cli/login?code=abc\x1b[0m"
+	if got := cleanLoginURL(line); got != "https://freebuff.com/cli/login?code=abc" {
+		t.Fatalf("login URL = %q", got)
+	}
+}
+
+func TestAccountSessionBindingSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	oneDir, twoDir := filepath.Join(dir, "one"), filepath.Join(dir, "two")
+	writeTestCredential(t, oneDir, "one@example.com")
+	writeTestCredential(t, twoDir, "two@example.com")
+	statePath := filepath.Join(dir, "state.json")
+	store := &stateStore{path: statePath, state: gatewayState{Accounts: []accountConfig{
+		{ID: "one", ConfigDir: oneDir, Enabled: true},
+		{ID: "two", ConfigDir: twoDir, Enabled: true},
+	}}}
+	if err := store.saveLocked(); err != nil {
+		t.Fatal(err)
+	}
+	firstManager := newAccountManager(store, "headless", "", dir, filepath.Join(dir, "accounts"))
+	_, expectedAccount, err := firstManager.acquire("private-session-id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstManager.finish(expectedAccount, nil)
+
+	reloadedStore, err := newStateStore(statePath, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondManager := newAccountManager(reloadedStore, "headless", "", dir, filepath.Join(dir, "accounts"))
+	_, actualAccount, err := secondManager.acquire("private-session-id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondManager.finish(actualAccount, nil)
+	if actualAccount != expectedAccount {
+		t.Fatalf("session account after restart = %s, want %s", actualAccount, expectedAccount)
+	}
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "private-session-id") {
+		t.Fatal("raw session id was persisted")
+	}
+}
+
+func TestConversationBindingSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	store := &stateStore{path: filepath.Join(dir, "state.json")}
+	firstRouter := newConversationRouter(store)
+	request := chatRequest{Model: defaultModel, Messages: []chatMessage{{Role: "user", Content: "private opening"}}}
+	selection := firstRouter.resolve(request, "")
+	firstRouter.bind(request, cliChatResult{Text: "private answer"}, selection)
+
+	reloadedStore, err := newStateStore(store.path, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRouter := newConversationRouter(reloadedStore)
+	continued := request
+	continued.Messages = append(continued.Messages, chatMessage{Role: "assistant", Content: "private answer"}, chatMessage{Role: "user", Content: "continue"})
+	if got := secondRouter.resolve(continued, "").ID; got != selection.ID {
+		t.Fatalf("conversation session after restart = %s, want %s", got, selection.ID)
+	}
+	data, err := os.ReadFile(store.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "private opening") || strings.Contains(string(data), "private answer") {
+		t.Fatal("conversation text was persisted")
+	}
+}
+
+func TestPrunePersistedSessionBindings(t *testing.T) {
+	now := time.Now()
+	state := gatewayState{
+		AccountSessions: map[string]accountSessionBinding{
+			"old":   {AccountID: "one", Updated: now.Add(-25 * time.Hour)},
+			"fresh": {AccountID: "one", Updated: now},
+		},
+		ConversationSessions: map[string]sessionBinding{
+			"old":   {ID: "old", Updated: now.Add(-25 * time.Hour)},
+			"fresh": {ID: "fresh", Updated: now},
+		},
+	}
+	if !prunePersistedSessionBindings(&state, now.Add(-sessionBindingTTL)) {
+		t.Fatal("prune reported no changes")
+	}
+	if _, found := state.AccountSessions["old"]; found {
+		t.Fatal("old account binding was retained")
+	}
+	if _, found := state.ConversationSessions["old"]; found {
+		t.Fatal("old conversation binding was retained")
+	}
+	if _, found := state.AccountSessions["fresh"]; !found {
+		t.Fatal("fresh account binding was removed")
+	}
+	if _, found := state.ConversationSessions["fresh"]; !found {
+		t.Fatal("fresh conversation binding was removed")
+	}
+}

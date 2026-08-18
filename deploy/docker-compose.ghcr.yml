@@ -1,0 +1,13 @@
+services:
+  freebuff-gateway:
+    image: ghcr.io/csy87704403/fbcli:latest
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      FREEBUFF_ADMIN_USER: ${FREEBUFF_ADMIN_USER:-admin}
+      FREEBUFF_ADMIN_PASSWORD: ${FREEBUFF_ADMIN_PASSWORD:?请在 .env 中设置后台密码}
+    volumes:
+      - freebuff-data:/var/lib/freebuff-gateway
+
+volumes:
+  freebuff-data:
