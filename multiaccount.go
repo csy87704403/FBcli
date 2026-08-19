@@ -386,7 +386,7 @@ func (m *accountManager) snapshots(selectedProxy string) []map[string]any {
 			"enabled": runtime.config.Enabled, "status": status, "current_exit": selectedProxy,
 			"active_sessions": boundSessions[runtime.config.ID], "active_requests": runtime.active,
 			"cli_open": cliOpen, "cli_pid": cliPID, "cli_started_at": cliStartedAt,
-			"models": 1, "last_error": runtime.lastError,
+			"models": len(gatewayModels), "last_error": runtime.lastError,
 			"last_at": runtime.lastUsed, "cooldown_until": runtime.cooldownUntil,
 		})
 	}

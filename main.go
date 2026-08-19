@@ -24,7 +24,20 @@ import (
 	"time"
 )
 
-const defaultModel = "deepseek/deepseek-v4-flash"
+const (
+	defaultModel = "deepseek/deepseek-v4-flash"
+	mimoModel    = "mimo/mimo-v2.5"
+)
+
+var gatewayModels = []string{defaultModel, mimoModel}
+
+func gatewayModelList() []map[string]any {
+	models := make([]map[string]any, 0, len(gatewayModels))
+	for _, model := range gatewayModels {
+		models = append(models, map[string]any{"id": model, "object": "model", "owned_by": "freebuff-cli"})
+	}
+	return models
+}
 
 type chatMessage struct {
 	Role       string           `json:"role"`
@@ -879,7 +892,7 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "backend": "freebuff-cli-jsonl"})
 	})
 	apiMux.HandleFunc("GET /v1/models", service.admin.requireAPIKey(func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": []map[string]any{{"id": defaultModel, "object": "model", "owned_by": "freebuff-cli"}}})
+		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": gatewayModelList()})
 	}))
 	apiMux.HandleFunc("POST /v1/chat/completions", service.admin.requireAPIKey(service.chatCompletions))
 	adminMux := http.NewServeMux()

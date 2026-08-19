@@ -5,6 +5,13 @@ import (
 	"testing"
 )
 
+func TestGatewayModelListIncludesDeepSeekAndMiMo(t *testing.T) {
+	models := gatewayModelList()
+	if len(models) != 2 || models[0]["id"] != defaultModel || models[1]["id"] != mimoModel {
+		t.Fatalf("unexpected model catalog: %#v", models)
+	}
+}
+
 func TestPromptFromMessages(t *testing.T) {
 	messages := []chatMessage{
 		{Role: "system", Content: "Be concise."},
