@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestOfficialTierProbeDoesNotSendAccountCredentials(t *testing.T) {
@@ -24,6 +25,78 @@ func TestOfficialTierProbeDoesNotSendAccountCredentials(t *testing.T) {
 	status := probeOfficialEgressTier(context.Background(), "", server.URL)
 	if status.Tier != "full" || status.Detail != "official_public_tier" || status.CheckedAt.IsZero() {
 		t.Fatalf("unexpected tier status: %#v", status)
+	}
+}
+
+func TestOfficialTierScanSortsFullNodesByOfficialLatency(t *testing.T) {
+	proxy := func(tier string, delay time.Duration) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" {
+				t.Fatalf("tier scan sent account credentials: %#v", r.Header)
+			}
+			time.Sleep(delay)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"accessTier":"` + tier + `"}`))
+		}))
+	}
+	slowFull := proxy("full", 50*time.Millisecond)
+	defer slowFull.Close()
+	limited := proxy("limited", 0)
+	defer limited.Close()
+	fastFull := proxy("full", 0)
+	defer fastFull.Close()
+
+	nodes := scanOfficialProxyTiers(context.Background(), []proxyNode{
+		{Addr: slowFull.URL}, {Addr: limited.URL}, {Addr: fastFull.URL},
+	}, "http://official.test/api/web/access-tier", 3)
+	if len(nodes) != 3 || nodes[0].Addr != fastFull.URL || nodes[0].Mode != "full" || nodes[1].Addr != slowFull.URL || nodes[2].Mode != "limited" {
+		t.Fatalf("unexpected tier order: %#v", nodes)
+	}
+	for _, node := range nodes {
+		if !node.Alive || node.TierCheckedAt.IsZero() || node.TierDetail != "official_public_tier" {
+			t.Fatalf("tier metadata missing: %#v", node)
+		}
+	}
+}
+
+func TestAutomaticProxySelectionKeepsCurrentFullNode(t *testing.T) {
+	nodes := []proxyNode{
+		{Addr: "fast", Mode: "full", TierLatencyMS: 10},
+		{Addr: "current", Mode: "full", TierLatencyMS: 50},
+	}
+	selected, _, fullCount := selectScannedProxy(nodes, "current", false)
+	if selected != "current" || fullCount != 2 {
+		t.Fatalf("automatic scan changed a healthy FULL exit: selected=%s full=%d", selected, fullCount)
+	}
+	selected, _, _ = selectScannedProxy(nodes, "current", true)
+	if selected != "fast" {
+		t.Fatalf("manual scan did not choose the fastest FULL exit: %s", selected)
+	}
+}
+
+func TestAutomaticProxySelectionReplacesNonFullNode(t *testing.T) {
+	nodes := []proxyNode{
+		{Addr: "fast", Mode: "full", TierLatencyMS: 10},
+		{Addr: "current", Mode: "limited", TierLatencyMS: 5},
+	}
+	selected, tier, _ := selectScannedProxy(nodes, "current", false)
+	if selected != "fast" || tier.Tier != "full" {
+		t.Fatalf("automatic scan kept a non-FULL exit: selected=%s tier=%s", selected, tier.Tier)
+	}
+}
+
+func TestLoadMihomoListenerNames(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	config := "listeners:\n  - name: freebuff-node-53\n    type: mixed\n    port: 10053\n    proxy: \"🇸🇬VIP新加坡6\"\n  - name: freebuff-node-54\n    port: 10054\n    proxy: '🇺🇸美国2'\n"
+	if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	names, err := loadMihomoListenerNames(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if names["10053"] != "🇸🇬VIP新加坡6" || names["10054"] != "🇺🇸美国2" {
+		t.Fatalf("unexpected listener names: %#v", names)
 	}
 }
 

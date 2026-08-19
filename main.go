@@ -840,6 +840,7 @@ func main() {
 	defaultAccountConfig := flag.String("default-account-config", "", "existing official CLI config directory to import once")
 	legacyConfig := flag.String("legacy-config", "", "optional old gateway config to import once")
 	legacyPool := flag.String("legacy-pool", "", "optional old proxy pool to import once")
+	mihomoConfig := flag.String("mihomo-config", os.Getenv("FREEBUFF_MIHOMO_CONFIG"), "Mihomo config used to map listener ports to node names")
 	flag.Parse()
 	if strings.TrimSpace(*cliPath) == "" {
 		log.Fatal("set -cli or FREEBUFF_HEADLESS_BIN")
@@ -869,7 +870,7 @@ func main() {
 	}
 	accounts := newAccountManager(store, *cliPath, *loginCLIPath, *cwd, *accountsRoot)
 	service := &server{accounts: accounts, sessions: newConversationRouter(store)}
-	service.admin = newAdminService(store, service, adminUser, adminPassword)
+	service.admin = newAdminService(store, service, adminUser, adminPassword, *mihomoConfig)
 	monitorContext, stopMonitor := context.WithCancel(context.Background())
 	defer stopMonitor()
 	service.admin.startEgressTierMonitor(monitorContext)

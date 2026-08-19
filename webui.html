@@ -41,14 +41,14 @@
 </section>
 
 <section class="page" id="page-ips">
- <div class="card"><div class="row"><h2 class="grow">当前实际出口权限</h2><button class="btn blue" onclick="detectEgressTier()">重新检测</button></div>
+ <div class="card"><div class="row"><h2 class="grow">FULL 节点扫描</h2><button class="btn blue" onclick="detectEgressTier()">检测 FULL 节点</button></div>
   <div id="egress-tier" class="muted">尚未检测</div>
-  <p class="muted">使用 Freebuff 官方公开接口判定，不发送账号 Token、Cookie，也不会创建对话 Session。该结果只描述当前出口，不用于按地区自动切换节点。</p>
+  <p class="muted">逐个出口请求 Freebuff 官方公开权限接口，不发送账号 Token、Cookie，也不会创建对话 Session。扫描后自动选择官方延迟最低的 FULL 节点。</p>
  </div>
  <div class="card"><div class="row"><h2 class="grow">出口 IP 池</h2><button class="btn blue" onclick="detectProxies()">检测连通性</button><button class="btn" onclick="saveProxies()">保存列表</button></div>
-  <p class="muted">节点池只检测网络连通性，不按国家或 FULL 权限筛选节点。只有检测在线的节点才能设为出口，切换会重启 CLI 子进程。</p>
+  <p class="muted">“检测连通性”只检查本地代理端口；“检测 FULL 节点”才会通过每个代理请求官方权限接口。出口切换会重启 CLI 子进程。</p>
   <textarea id="proxy-input" placeholder="每行一个：http://127.0.0.1:10001 或 socks5://host:port"></textarea>
-  <div style="overflow:auto"><table><thead><tr><th>地址</th><th>连通延迟</th><th>状态</th><th>详情</th><th>操作</th></tr></thead><tbody id="proxy-body"></tbody></table></div>
+  <div style="overflow:auto"><table><thead><tr><th>地址</th><th>节点详情</th><th>官方权限</th><th>官方延迟</th><th>连通延迟</th><th>状态</th><th>检测详情</th><th>操作</th></tr></thead><tbody id="proxy-body"></tbody></table></div>
  </div>
 </section>
 </div><div id="flash"></div><script src="/webui.js"></script></body></html>

@@ -1,17 +1,20 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	cryptorand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,8 +31,11 @@ type egressTierStatus struct {
 
 type proxyNode struct {
 	Addr          string    `json:"addr"`
+	Name          string    `json:"name,omitempty"`
 	Mode          string    `json:"mode,omitempty"`
 	TierCheckedAt time.Time `json:"tier_checked_at,omitempty"`
+	TierLatencyMS int64     `json:"tier_latency_ms,omitempty"`
+	TierDetail    string    `json:"tier_detail,omitempty"`
 	Detail        string    `json:"detail,omitempty"`
 	LatencyMS     int64     `json:"latency_ms,omitempty"`
 	Alive         bool      `json:"alive"`
@@ -207,16 +213,18 @@ func (s *stateStore) selectedProxy() string {
 }
 
 type adminService struct {
-	store     *stateStore
-	server    *server
-	auth      *adminAuthenticator
-	runtimeMu sync.RWMutex
-	lastError string
-	lastAt    time.Time
+	store        *stateStore
+	server       *server
+	auth         *adminAuthenticator
+	mihomoConfig string
+	runtimeMu    sync.RWMutex
+	proxyScanMu  sync.Mutex
+	lastError    string
+	lastAt       time.Time
 }
 
-func newAdminService(store *stateStore, server *server, username, password string) *adminService {
-	return &adminService{store: store, server: server, auth: newAdminAuthenticator(username, password)}
+func newAdminService(store *stateStore, server *server, username, password, mihomoConfig string) *adminService {
+	return &adminService{store: store, server: server, auth: newAdminAuthenticator(username, password), mihomoConfig: mihomoConfig}
 }
 
 func (a *adminService) register(mux *http.ServeMux) {
@@ -242,6 +250,7 @@ func (a *adminService) register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/webui/proxy/refresh", a.auth.require(a.refreshProxies))
 	mux.HandleFunc("POST /api/webui/proxy/select", a.auth.require(a.selectProxy))
 	mux.HandleFunc("POST /api/webui/proxy/egress-tier", a.auth.require(a.refreshEgressTier))
+	mux.HandleFunc("POST /api/webui/proxy/scan-full", a.auth.require(a.scanFullProxies))
 }
 
 func (a *adminService) loginPage(w http.ResponseWriter, r *http.Request) {
@@ -510,7 +519,87 @@ func (a *adminService) proxyPool(w http.ResponseWriter, _ *http.Request) {
 	selected := a.store.state.SelectedProxy
 	egressTier := a.store.state.EgressTier
 	a.store.mu.RUnlock()
+	nodes = a.enrichProxyNames(nodes)
 	writeJSON(w, http.StatusOK, map[string]any{"items": nodes, "selected": selected, "egress_tier": egressTier})
+}
+
+func yamlScalar(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 && value[0] == '"' {
+		if decoded, err := strconv.Unquote(value); err == nil {
+			return decoded
+		}
+	}
+	if len(value) >= 2 && value[0] == '\'' && value[len(value)-1] == '\'' {
+		return strings.ReplaceAll(value[1:len(value)-1], "''", "'")
+	}
+	if index := strings.Index(value, " #"); index >= 0 {
+		value = value[:index]
+	}
+	return strings.TrimSpace(value)
+}
+
+func loadMihomoListenerNames(path string) (map[string]string, error) {
+	file, err := os.Open(strings.TrimSpace(path))
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	names := make(map[string]string)
+	scanner := bufio.NewScanner(file)
+	inListeners := false
+	port, proxy := "", ""
+	flush := func() {
+		if port != "" && proxy != "" {
+			names[port] = proxy
+		}
+		port, proxy = "", ""
+	}
+	for scanner.Scan() {
+		line := scanner.Text()
+		trimmed := strings.TrimSpace(line)
+		if !inListeners {
+			inListeners = trimmed == "listeners:"
+			continue
+		}
+		if trimmed != "" && len(line) > 0 && line[0] != ' ' && line[0] != '\t' {
+			break
+		}
+		if strings.HasPrefix(trimmed, "- name:") {
+			flush()
+			continue
+		}
+		if strings.HasPrefix(trimmed, "port:") {
+			port = yamlScalar(strings.TrimSpace(strings.TrimPrefix(trimmed, "port:")))
+		}
+		if strings.HasPrefix(trimmed, "proxy:") {
+			proxy = yamlScalar(strings.TrimSpace(strings.TrimPrefix(trimmed, "proxy:")))
+		}
+	}
+	flush()
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return names, nil
+}
+
+func (a *adminService) enrichProxyNames(nodes []proxyNode) []proxyNode {
+	if strings.TrimSpace(a.mihomoConfig) == "" {
+		return nodes
+	}
+	names, err := loadMihomoListenerNames(a.mihomoConfig)
+	if err != nil {
+		log.Printf("load Mihomo listener names: %v", err)
+		return nodes
+	}
+	for index := range nodes {
+		parsed, err := url.Parse(nodes[index].Addr)
+		if err != nil {
+			continue
+		}
+		nodes[index].Name = names[parsed.Port()]
+	}
+	return nodes
 }
 
 func probeOfficialEgressTier(ctx context.Context, proxyAddr, endpoint string) egressTierStatus {
@@ -581,9 +670,149 @@ func (a *adminService) refreshEgressTier(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, a.updateEgressTier(r.Context()))
 }
 
+func tierRank(mode string) int {
+	switch strings.ToLower(mode) {
+	case "full":
+		return 0
+	case "limited":
+		return 1
+	default:
+		return 2
+	}
+}
+
+func scanOfficialProxyTiers(ctx context.Context, nodes []proxyNode, endpoint string, concurrency int) []proxyNode {
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	var wait sync.WaitGroup
+	limit := make(chan struct{}, concurrency)
+	for index := range nodes {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			limit <- struct{}{}
+			status := probeOfficialEgressTier(ctx, nodes[index].Addr, endpoint)
+			<-limit
+			nodes[index].Mode = status.Tier
+			nodes[index].TierCheckedAt = status.CheckedAt
+			nodes[index].TierLatencyMS = status.LatencyMS
+			nodes[index].TierDetail = status.Detail
+			nodes[index].LastChecked = status.CheckedAt
+			nodes[index].Alive = status.Tier == "full" || status.Tier == "limited"
+			if nodes[index].Alive {
+				nodes[index].LastOK = status.CheckedAt
+				nodes[index].FailCount = 0
+			} else {
+				nodes[index].FailCount++
+			}
+		}(index)
+	}
+	wait.Wait()
+	sort.SliceStable(nodes, func(i, j int) bool {
+		left, right := tierRank(nodes[i].Mode), tierRank(nodes[j].Mode)
+		if left != right {
+			return left < right
+		}
+		return nodes[i].TierLatencyMS < nodes[j].TierLatencyMS
+	})
+	return nodes
+}
+
+func selectScannedProxy(nodes []proxyNode, previousSelected string, forceLowest bool) (string, egressTierStatus, int) {
+	selected := previousSelected
+	fullCount := 0
+	var fastestFull *proxyNode
+	var current *proxyNode
+	for index := range nodes {
+		node := &nodes[index]
+		if node.Mode == "full" {
+			fullCount++
+			if fastestFull == nil {
+				fastestFull = node
+			}
+		}
+		if node.Addr == previousSelected {
+			current = node
+		}
+	}
+	if fastestFull != nil && (forceLowest || current == nil || current.Mode != "full") {
+		selected = fastestFull.Addr
+		current = fastestFull
+	}
+	if current == nil || current.Addr != selected {
+		current = nil
+		for index := range nodes {
+			if nodes[index].Addr == selected {
+				current = &nodes[index]
+				break
+			}
+		}
+	}
+	if current == nil {
+		return selected, egressTierStatus{Tier: "unknown", Detail: "selected_proxy_not_in_pool", CheckedAt: time.Now()}, fullCount
+	}
+	return selected, egressTierStatus{
+		Tier: current.Mode, Detail: current.TierDetail, CheckedAt: current.TierCheckedAt, LatencyMS: current.TierLatencyMS,
+	}, fullCount
+}
+
+func (a *adminService) scanProxyPool(ctx context.Context, forceLowest bool) ([]proxyNode, string, egressTierStatus, int, error) {
+	a.proxyScanMu.Lock()
+	defer a.proxyScanMu.Unlock()
+
+	a.store.mu.RLock()
+	nodes := append([]proxyNode(nil), a.store.state.Proxies...)
+	previousSelected := a.store.state.SelectedProxy
+	a.store.mu.RUnlock()
+	if len(nodes) == 0 {
+		return nil, "", egressTierStatus{}, 0, fmt.Errorf("IP 池为空，请先保存节点")
+	}
+
+	nodes = scanOfficialProxyTiers(ctx, nodes, officialAccessTierURL, 8)
+	nodes = a.enrichProxyNames(nodes)
+	selected, selectedTier, fullCount := selectScannedProxy(nodes, previousSelected, forceLowest)
+	a.store.mu.Lock()
+	a.store.state.Proxies = nodes
+	a.store.state.SelectedProxy = selected
+	a.store.state.EgressTier = selectedTier
+	err := a.store.saveLocked()
+	a.store.mu.Unlock()
+	if err != nil {
+		return nil, "", egressTierStatus{}, 0, err
+	}
+	if selected != previousSelected && a.server != nil && a.server.accounts != nil {
+		a.server.accounts.setProxy(selected)
+	}
+	return nodes, selected, selectedTier, fullCount, nil
+}
+
+func (a *adminService) scanFullProxies(w http.ResponseWriter, r *http.Request) {
+	nodes, selected, selectedTier, fullCount, err := a.scanProxyPool(r.Context(), true)
+	if err != nil {
+		status, code := http.StatusInternalServerError, "state_write_failed"
+		if strings.Contains(err.Error(), "IP 池为空") {
+			status, code = http.StatusBadRequest, "proxy_pool_empty"
+		}
+		writeError(w, status, err.Error(), code)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items": nodes, "selected": selected, "full_count": fullCount, "egress_tier": selectedTier,
+	})
+}
+
 func (a *adminService) startEgressTierMonitor(ctx context.Context) {
 	go func() {
-		a.updateEgressTier(ctx)
+		scan := func() {
+			_, selected, tier, fullCount, err := a.scanProxyPool(ctx, false)
+			if err != nil {
+				log.Printf("automatic FULL proxy scan failed: %v", err)
+				return
+			}
+			log.Printf("automatic FULL proxy scan completed: full=%d selected=%s tier=%s", fullCount, selected, tier.Tier)
+		}
+		scan()
 		ticker := time.NewTicker(30 * time.Minute)
 		defer ticker.Stop()
 		for {
@@ -591,7 +820,7 @@ func (a *adminService) startEgressTierMonitor(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				a.updateEgressTier(ctx)
+				scan()
 			}
 		}
 	}()
