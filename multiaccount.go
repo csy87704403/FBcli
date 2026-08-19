@@ -99,6 +99,7 @@ type accountRuntime struct {
 	config        accountConfig
 	client        *cliClient
 	active        int
+	activeModel   string
 	lastUsed      time.Time
 	lastError     string
 	cooldownUntil time.Time
@@ -201,7 +202,17 @@ func (m *accountManager) reapIdleProcesses() {
 	}
 }
 
-func (m *accountManager) acquire(sessionID string) (*cliClient, string, error) {
+func modelAffinityRank(activeModel, requestedModel string) int {
+	if activeModel == requestedModel {
+		return 0
+	}
+	if activeModel == "" {
+		return 1
+	}
+	return 2
+}
+
+func (m *accountManager) acquire(sessionID, requestedModel string) (*cliClient, string, error) {
 	sessionID = accountSessionKey(sessionID)
 	m.mu.Lock()
 	if m.configuring {
@@ -236,7 +247,8 @@ func (m *accountManager) acquire(sessionID string) (*cliClient, string, error) {
 			continue
 		}
 		if selected == nil || runtime.active < selected.active ||
-			(runtime.active == selected.active && runtime.lastUsed.Before(selected.lastUsed)) {
+			(runtime.active == selected.active && modelAffinityRank(runtime.activeModel, requestedModel) < modelAffinityRank(selected.activeModel, requestedModel)) ||
+			(runtime.active == selected.active && modelAffinityRank(runtime.activeModel, requestedModel) == modelAffinityRank(selected.activeModel, requestedModel) && runtime.lastUsed.Before(selected.lastUsed)) {
 			selected = runtime
 		}
 	}
@@ -280,7 +292,7 @@ func (m *accountManager) persistAccountSession(sessionID string, binding account
 	return nil
 }
 
-func (m *accountManager) finish(accountID string, requestErr error) {
+func (m *accountManager) finish(accountID, model string, requestErr error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	runtime := m.runtimes[accountID]
@@ -292,6 +304,7 @@ func (m *accountManager) finish(accountID string, requestErr error) {
 	}
 	runtime.lastUsed = time.Now()
 	if requestErr == nil {
+		runtime.activeModel = model
 		runtime.lastError = ""
 		return
 	}
@@ -387,7 +400,8 @@ func (m *accountManager) snapshots(selectedProxy string) []map[string]any {
 			"active_sessions": boundSessions[runtime.config.ID], "active_requests": runtime.active,
 			"cli_open": cliOpen, "cli_pid": cliPID, "cli_started_at": cliStartedAt,
 			"models": len(gatewayModels), "last_error": runtime.lastError,
-			"last_at": runtime.lastUsed, "cooldown_until": runtime.cooldownUntil,
+			"active_model": runtime.activeModel,
+			"last_at":      runtime.lastUsed, "cooldown_until": runtime.cooldownUntil,
 		})
 	}
 	return result

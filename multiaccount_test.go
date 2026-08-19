@@ -83,27 +83,53 @@ func TestAccountSchedulerBalancesAndPinsSessions(t *testing.T) {
 	}}}
 	manager := newAccountManager(store, "headless", "", dir, filepath.Join(dir, "accounts"))
 
-	_, firstAccount, err := manager.acquire("session-one")
+	_, firstAccount, err := manager.acquire("session-one", defaultModel)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, secondAccount, err := manager.acquire("session-two")
+	_, secondAccount, err := manager.acquire("session-two", defaultModel)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if firstAccount == secondAccount {
 		t.Fatalf("two concurrent sessions selected the same account: %s", firstAccount)
 	}
-	manager.finish(firstAccount, nil)
-	manager.finish(secondAccount, nil)
+	manager.finish(firstAccount, defaultModel, nil)
+	manager.finish(secondAccount, defaultModel, nil)
 
-	_, resumedAccount, err := manager.acquire("session-one")
+	_, resumedAccount, err := manager.acquire("session-one", defaultModel)
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager.finish(resumedAccount, nil)
+	manager.finish(resumedAccount, defaultModel, nil)
 	if resumedAccount != firstAccount {
 		t.Fatalf("session moved accounts: got %s, want %s", resumedAccount, firstAccount)
+	}
+}
+
+func TestAccountSchedulerPrefersEmptyAccountForDifferentModel(t *testing.T) {
+	dir := t.TempDir()
+	oneDir, twoDir := filepath.Join(dir, "one"), filepath.Join(dir, "two")
+	writeTestCredential(t, oneDir, "one@example.com")
+	writeTestCredential(t, twoDir, "two@example.com")
+	store := &stateStore{path: filepath.Join(dir, "state.json"), state: gatewayState{Accounts: []accountConfig{
+		{ID: "one", ConfigDir: oneDir, Enabled: true},
+		{ID: "two", ConfigDir: twoDir, Enabled: true},
+	}}}
+	manager := newAccountManager(store, "headless", "", dir, filepath.Join(dir, "accounts"))
+
+	_, deepSeekAccount, err := manager.acquire("deepseek-session", defaultModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.finish(deepSeekAccount, defaultModel, nil)
+	_, mimoAccount, err := manager.acquire("mimo-session", mimoModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.finish(mimoAccount, mimoModel, nil)
+	if mimoAccount == deepSeekAccount {
+		t.Fatalf("MiMo reused the DeepSeek-locked account while an empty account was available: %s", mimoAccount)
 	}
 }
 
@@ -113,19 +139,19 @@ func TestLimitedAccountEntersCooldown(t *testing.T) {
 	writeTestCredential(t, accountDir, "one@example.com")
 	store := &stateStore{path: filepath.Join(dir, "state.json"), state: gatewayState{Accounts: []accountConfig{{ID: "one", ConfigDir: accountDir, Enabled: true}}}}
 	manager := newAccountManager(store, "headless", "", dir, filepath.Join(dir, "accounts"))
-	_, accountID, err := manager.acquire("session")
+	_, accountID, err := manager.acquire("session", defaultModel)
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager.finish(accountID, os.ErrDeadlineExceeded)
+	manager.finish(accountID, defaultModel, os.ErrDeadlineExceeded)
 	if !manager.runtimes[accountID].cooldownUntil.IsZero() {
 		t.Fatal("transport error incorrectly cooled down the account")
 	}
-	_, accountID, err = manager.acquire("limited-session")
+	_, accountID, err = manager.acquire("limited-session", defaultModel)
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager.finish(accountID, &testError{"free session rate_limited"})
+	manager.finish(accountID, defaultModel, &testError{"free session rate_limited"})
 	if !manager.runtimes[accountID].cooldownUntil.After(time.Now()) {
 		t.Fatal("rate-limited account did not enter cooldown")
 	}
@@ -169,22 +195,22 @@ func TestAccountSessionBindingSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	firstManager := newAccountManager(store, "headless", "", dir, filepath.Join(dir, "accounts"))
-	_, expectedAccount, err := firstManager.acquire("private-session-id")
+	_, expectedAccount, err := firstManager.acquire("private-session-id", defaultModel)
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstManager.finish(expectedAccount, nil)
+	firstManager.finish(expectedAccount, defaultModel, nil)
 
 	reloadedStore, err := newStateStore(statePath, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	secondManager := newAccountManager(reloadedStore, "headless", "", dir, filepath.Join(dir, "accounts"))
-	_, actualAccount, err := secondManager.acquire("private-session-id")
+	_, actualAccount, err := secondManager.acquire("private-session-id", defaultModel)
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondManager.finish(actualAccount, nil)
+	secondManager.finish(actualAccount, defaultModel, nil)
 	if actualAccount != expectedAccount {
 		t.Fatalf("session account after restart = %s, want %s", actualAccount, expectedAccount)
 	}

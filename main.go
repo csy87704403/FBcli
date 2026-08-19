@@ -752,7 +752,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	id := fmt.Sprintf("chatcmpl-cli-%d", time.Now().UnixNano())
 	created := time.Now().Unix()
 	selection := s.sessions.resolve(request, r.Header.Get("X-Freebuff-Session-ID"))
-	client, accountID, err := s.accounts.acquire(selection.ID)
+	client, accountID, err := s.accounts.acquire(selection.ID, model)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, err.Error(), "account_unavailable")
 		return
@@ -782,7 +782,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		result, err := client.chat(r.Context(), model, selection.ID, prompt, content, request.Tools, toolResult, onDelta)
-		s.accounts.finish(accountID, err)
+		s.accounts.finish(accountID, model, err)
 		if err != nil {
 			s.admin.recordUsage(model, apiKeyFromRequest(r), inputChars, outputChars, false, time.Since(startedAt), err)
 			data, _ := json.Marshal(map[string]any{"error": map[string]any{"message": err.Error(), "type": "cli_request_failed"}})
@@ -811,7 +811,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result, err := client.chat(r.Context(), model, selection.ID, prompt, content, request.Tools, toolResult, nil)
-	s.accounts.finish(accountID, err)
+	s.accounts.finish(accountID, model, err)
 	if err != nil {
 		s.admin.recordUsage(model, apiKeyFromRequest(r), inputChars, 0, false, time.Since(startedAt), err)
 		writeError(w, http.StatusBadGateway, err.Error(), "cli_request_failed")

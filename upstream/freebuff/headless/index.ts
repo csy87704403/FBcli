@@ -312,6 +312,12 @@ async function callSession(
 async function ensureFreebuffSession(requestedModel: string) {
   const token = requireAuthToken()
 
+  const replaceModelSession = async () => {
+    await callSession('DELETE', token)
+    activeSession = undefined
+    return callSession('POST', token, requestedModel)
+  }
+
   if (activeSession) {
     const current = await callSession('GET', token)
     if (
@@ -320,16 +326,24 @@ async function ensureFreebuffSession(requestedModel: string) {
     ) {
       activeSession = current
       if (current.model !== requestedModel) {
-        throw new Error(
-          `active Freebuff session is locked to ${current.model}; requested ${requestedModel}`,
-        )
+        const switched = await replaceModelSession()
+        if (switched.status !== 'active') {
+          throw new Error(
+            `Freebuff session admission returned ${switched.status}`,
+          )
+        }
+        activeSession = switched
+        return { token, session: switched }
       }
       return { token, session: current }
     }
     activeSession = undefined
   }
 
-  const admitted = await callSession('POST', token, requestedModel)
+  let admitted = await callSession('POST', token, requestedModel)
+  if (admitted.status === 'model_locked') {
+    admitted = await replaceModelSession()
+  }
   if (admitted.status !== 'active') {
     throw new Error(`Freebuff session admission returned ${admitted.status}`)
   }
