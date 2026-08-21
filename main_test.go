@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 )
@@ -121,6 +122,37 @@ func TestConversationRouterExplicitIDWins(t *testing.T) {
 	}
 	if got := router.resolve(request, "").ID; got != "user-request-user" {
 		t.Fatalf("user session id = %q", got)
+	}
+}
+
+func TestConversationRouterRestoresHermesToolResultByCallID(t *testing.T) {
+	router := newConversationRouter()
+	first := chatRequest{Model: defaultModel, Messages: []chatMessage{{Role: "user", Content: "inspect files"}}}
+	selection := router.resolve(first, "")
+	call := openAIToolCall{ID: "call-hermes-1"}
+	call.Function.Name = "search_files"
+	router.bind(first, cliChatResult{ToolCalls: []openAIToolCall{call}}, selection)
+	toolResult := chatRequest{Model: defaultModel, Messages: []chatMessage{
+		{Role: "user", Content: "inspect files"},
+		{Role: "assistant", ToolCalls: []openAIToolCall{call}},
+		{Role: "tool", ToolCallID: call.ID, Content: "[]"},
+	}}
+	if got := router.resolve(toolResult, "").ID; got != selection.ID {
+		t.Fatalf("Hermes tool result session = %q, want %q", got, selection.ID)
+	}
+}
+
+func TestConversationRouterCapsPendingToolBindings(t *testing.T) {
+	router := newConversationRouter()
+	request := chatRequest{Model: defaultModel, Messages: []chatMessage{{Role: "user", Content: "inspect files"}}}
+	selection := router.resolve(request, "")
+	calls := make([]openAIToolCall, maxToolCallBindings+1)
+	for index := range calls {
+		calls[index].ID = fmt.Sprintf("call-%d", index)
+	}
+	router.bind(request, cliChatResult{ToolCalls: calls}, selection)
+	if got := len(router.byToolCall); got != maxToolCallBindings {
+		t.Fatalf("pending tool bindings = %d, want %d", got, maxToolCallBindings)
 	}
 }
 

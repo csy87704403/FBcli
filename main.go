@@ -115,9 +115,10 @@ type sessionBinding struct {
 }
 
 type conversationRouter struct {
-	mu        sync.Mutex
-	byHistory map[string]sessionBinding
-	store     *stateStore
+	mu         sync.Mutex
+	byHistory  map[string]sessionBinding
+	byToolCall map[string]sessionBinding
+	store      *stateStore
 }
 
 type pendingToolCall struct {
@@ -693,10 +694,16 @@ func historyKeyForResult(request chatRequest, result cliChatResult) (string, boo
 	return historyKey(request)
 }
 
-const sessionBindingTTL = 24 * time.Hour
+const (
+	sessionBindingTTL   = 24 * time.Hour
+	maxToolCallBindings = 4096
+)
 
 func newConversationRouter(stores ...*stateStore) *conversationRouter {
-	router := &conversationRouter{byHistory: make(map[string]sessionBinding)}
+	router := &conversationRouter{
+		byHistory:  make(map[string]sessionBinding),
+		byToolCall: make(map[string]sessionBinding),
+	}
 	if len(stores) == 0 || stores[0] == nil {
 		return router
 	}
@@ -746,6 +753,11 @@ func (router *conversationRouter) reapExpired() {
 				changed = true
 			}
 		}
+		for toolCallID, binding := range router.byToolCall {
+			if binding.Updated.Before(cutoff) {
+				delete(router.byToolCall, toolCallID)
+			}
+		}
 		router.mu.Unlock()
 		if !changed || router.store == nil {
 			continue
@@ -768,6 +780,16 @@ func (router *conversationRouter) resolve(request chatRequest, header string) se
 	if explicit := explicitSessionID(request, header); explicit != "" {
 		return sessionSelection{ID: explicit}
 	}
+	if toolResult := lastToolResult(request.Messages); toolResult != nil {
+		router.mu.Lock()
+		if binding, ok := router.byToolCall[toolResult.ToolCallID]; ok && binding.ID != "" {
+			binding.Updated = time.Now()
+			router.byToolCall[toolResult.ToolCallID] = binding
+			router.mu.Unlock()
+			return sessionSelection{ID: binding.ID, Automatic: true}
+		}
+		router.mu.Unlock()
+	}
 	key, found := historyKey(request)
 	if !found {
 		return sessionSelection{ID: newAutoSessionID(), Automatic: true}
@@ -783,6 +805,15 @@ func (router *conversationRouter) resolve(request chatRequest, header string) se
 	return sessionSelection{ID: newAutoSessionID(), Automatic: true}
 }
 
+func (router *conversationRouter) completeToolResult(toolCallID string) {
+	if toolCallID == "" {
+		return
+	}
+	router.mu.Lock()
+	delete(router.byToolCall, toolCallID)
+	router.mu.Unlock()
+}
+
 func (router *conversationRouter) bind(request chatRequest, result cliChatResult, selection sessionSelection) {
 	if !selection.Automatic {
 		return
@@ -791,22 +822,43 @@ func (router *conversationRouter) bind(request chatRequest, result cliChatResult
 	if !found {
 		key, found = historyKeyForResult(request, result)
 	}
-	if !found {
+	if !found && len(result.ToolCalls) == 0 {
 		return
 	}
 	router.mu.Lock()
-	if existing, ok := router.byHistory[key]; ok && existing.ID != selection.ID {
-		binding := sessionBinding{Updated: time.Now()}
-		router.byHistory[key] = binding
-		router.mu.Unlock()
-		router.persist(key, binding, true)
-		return
+	if found {
+		if existing, ok := router.byHistory[key]; ok && existing.ID != selection.ID {
+			binding := sessionBinding{Updated: time.Now()}
+			router.byHistory[key] = binding
+			router.mu.Unlock()
+			router.persist(key, binding, true)
+			return
+		}
 	}
 	binding := sessionBinding{ID: selection.ID, Updated: time.Now()}
-	router.byHistory[key] = binding
+	if found {
+		router.byHistory[key] = binding
+	}
+	for _, toolCall := range result.ToolCalls {
+		if toolCall.ID != "" {
+			router.byToolCall[toolCall.ID] = binding
+		}
+	}
+	for len(router.byToolCall) > maxToolCallBindings {
+		var oldestID string
+		var oldest time.Time
+		for toolCallID, candidate := range router.byToolCall {
+			if oldestID == "" || candidate.Updated.Before(oldest) {
+				oldestID, oldest = toolCallID, candidate.Updated
+			}
+		}
+		delete(router.byToolCall, oldestID)
+	}
 	if len(router.byHistory) <= 4096 {
 		router.mu.Unlock()
-		router.persist(key, binding, true)
+		if found {
+			router.persist(key, binding, true)
+		}
 		return
 	}
 	var oldestKey string
@@ -914,6 +966,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", data)
 			return
 		}
+		if toolResult != nil {
+			s.sessions.completeToolResult(toolResult.ToolCallID)
+		}
 		s.admin.recordUsage(model, apiKeyFromRequest(r), inputChars, outputChars, true, time.Since(startedAt), nil)
 		s.sessions.bind(request, result, selection)
 		finishReason := "stop"
@@ -941,6 +996,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		s.admin.recordUsage(model, apiKeyFromRequest(r), inputChars, 0, false, time.Since(startedAt), err)
 		writeError(w, http.StatusBadGateway, err.Error(), "cli_request_failed")
 		return
+	}
+	if toolResult != nil {
+		s.sessions.completeToolResult(toolResult.ToolCallID)
 	}
 	s.admin.recordUsage(model, apiKeyFromRequest(r), inputChars, len([]rune(result.Text)), true, time.Since(startedAt), nil)
 	s.sessions.bind(request, result, selection)
