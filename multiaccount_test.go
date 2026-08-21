@@ -133,6 +133,56 @@ func TestAccountSchedulerPrefersEmptyAccountForDifferentModel(t *testing.T) {
 	}
 }
 
+func TestAccountSchedulerSkipsAccountWaitingForAnotherToolResult(t *testing.T) {
+	dir := t.TempDir()
+	oneDir, twoDir := filepath.Join(dir, "one"), filepath.Join(dir, "two")
+	writeTestCredential(t, oneDir, "one@example.com")
+	writeTestCredential(t, twoDir, "two@example.com")
+	store := &stateStore{path: filepath.Join(dir, "state.json"), state: gatewayState{Accounts: []accountConfig{
+		{ID: "one", ConfigDir: oneDir, Enabled: true},
+		{ID: "two", ConfigDir: twoDir, Enabled: true},
+	}}}
+	manager := newAccountManager(store, "headless", "", dir, filepath.Join(dir, "accounts"))
+	manager.runtimes["one"].client.pending = &pendingToolCall{SessionID: "blocked-session", CreatedAt: time.Now()}
+
+	_, accountID, err := manager.acquire("new-session", defaultModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.finish(accountID, defaultModel, nil)
+	if accountID != "two" {
+		t.Fatalf("new session used account waiting for another tool result: %s", accountID)
+	}
+}
+
+func TestToolLoopIsResetInsteadOfPersisting(t *testing.T) {
+	client := &cliClient{}
+	call := openAIToolCall{ID: "call-1"}
+	call.Function.Name = "read_file"
+	call.Function.Arguments = `{"path":"a.txt"}`
+	for i := 0; i < maxRepeatedToolCalls; i++ {
+		if err := client.setPendingToolCall("request", "session", call); err != nil {
+			t.Fatalf("tool call %d unexpectedly failed: %v", i+1, err)
+		}
+	}
+	if err := client.setPendingToolCall("request", "session", call); err == nil {
+		t.Fatal("repeated tool loop was not rejected")
+	}
+	if client.pending != nil || client.toolCalls != 0 {
+		t.Fatal("tool state remained after loop reset")
+	}
+}
+
+func TestExpiredToolCallIsReset(t *testing.T) {
+	client := &cliClient{pending: &pendingToolCall{SessionID: "session", CreatedAt: time.Now().Add(-staleToolResultTimeout)}}
+	if !client.recoverExpiredToolCall(time.Now()) {
+		t.Fatal("expired tool call was not reset")
+	}
+	if client.pending != nil {
+		t.Fatal("expired tool call remained pending")
+	}
+}
+
 func TestLimitedAccountEntersCooldown(t *testing.T) {
 	dir := t.TempDir()
 	accountDir := filepath.Join(dir, "one")

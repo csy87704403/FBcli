@@ -172,6 +172,7 @@ func (m *accountManager) reapIdleProcesses() {
 		bindingsChanged := false
 		m.mu.Lock()
 		for _, runtime := range m.runtimes {
+			runtime.client.recoverExpiredToolCall(time.Now())
 			if runtime.active == 0 && !runtime.lastUsed.IsZero() && time.Since(runtime.lastUsed) >= 10*time.Minute {
 				clients = append(clients, runtime.client)
 			}
@@ -213,7 +214,8 @@ func modelAffinityRank(activeModel, requestedModel string) int {
 }
 
 func (m *accountManager) acquire(sessionID, requestedModel string) (*cliClient, string, error) {
-	sessionID = accountSessionKey(sessionID)
+	rawSessionID := sessionID
+	sessionID = accountSessionKey(rawSessionID)
 	m.mu.Lock()
 	if m.configuring {
 		m.mu.Unlock()
@@ -230,6 +232,11 @@ func (m *accountManager) acquire(sessionID, requestedModel string) (*cliClient, 
 			m.mu.Unlock()
 			return nil, "", fmt.Errorf("conversation account is cooling down until %s", runtime.cooldownUntil.Format(time.RFC3339))
 		}
+		runtime.client.recoverExpiredToolCall(now)
+		if pendingSession := runtime.client.pendingSession(); pendingSession != "" && pendingSession != rawSessionID {
+			m.mu.Unlock()
+			return nil, "", errors.New("conversation account is waiting for another session's tool result")
+		}
 		runtime.active++
 		binding.Updated = now
 		m.sessionAccounts[sessionID] = binding
@@ -240,10 +247,14 @@ func (m *accountManager) acquire(sessionID, requestedModel string) (*cliClient, 
 	delete(m.sessionAccounts, sessionID)
 	var selected *accountRuntime
 	for _, runtime := range m.runtimes {
+		runtime.client.recoverExpiredToolCall(now)
 		if !runtime.config.Enabled || runtime.cooldownUntil.After(now) {
 			continue
 		}
 		if !readAccountCredential(runtime.config.ConfigDir).Authenticated {
+			continue
+		}
+		if pendingSession := runtime.client.pendingSession(); pendingSession != "" && pendingSession != rawSessionID {
 			continue
 		}
 		if selected == nil || runtime.active < selected.active ||

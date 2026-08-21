@@ -27,6 +27,13 @@ import (
 const (
 	defaultModel = "deepseek/deepseek-v4-flash"
 	mimoModel    = "mimo/mimo-v2.5"
+
+	// An external tool result normally arrives immediately after a tool call. These
+	// limits turn a broken Agent tool loop into a recoverable request failure rather
+	// than leaving its account process permanently occupied.
+	staleToolResultTimeout = 3 * time.Minute
+	maxExternalToolCalls   = 48
+	maxRepeatedToolCalls   = 5
 )
 
 var gatewayModels = []string{defaultModel, mimoModel}
@@ -111,6 +118,7 @@ type pendingToolCall struct {
 	SessionID  string
 	ToolCallID string
 	ToolName   string
+	CreatedAt  time.Time
 }
 
 type cliClient struct {
@@ -123,6 +131,9 @@ type cliClient struct {
 	stdin            io.WriteCloser
 	scanner          *bufio.Scanner
 	pending          *pendingToolCall
+	toolCalls        int
+	lastToolCall     string
+	repeatedToolCall int
 	proxy            string
 	processPID       int
 	processStartedAt time.Time
@@ -214,6 +225,17 @@ func (c *cliClient) stop() {
 	c.resetProcess()
 }
 
+func (c *cliClient) clearToolState() {
+	c.pending = nil
+	c.toolCalls = 0
+	c.lastToolCall = ""
+	c.repeatedToolCall = 0
+}
+
+func (c *cliClient) clearPendingTool() {
+	c.pending = nil
+}
+
 func (c *cliClient) resetProcess() {
 	if c.stdin != nil {
 		_ = c.stdin.Close()
@@ -223,10 +245,50 @@ func (c *cliClient) resetProcess() {
 		_, _, _ = c.cmd.ProcessState, c.cmd.Process, c.cmd.Wait()
 	}
 	c.cmd, c.stdin, c.scanner = nil, nil, nil
+	c.clearToolState()
 	c.processMu.Lock()
 	c.processPID = 0
 	c.processStartedAt = time.Time{}
 	c.processMu.Unlock()
+}
+
+func (c *cliClient) pendingSession() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pending == nil {
+		return ""
+	}
+	return c.pending.SessionID
+}
+
+func (c *cliClient) recoverExpiredToolCall(now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pending == nil || now.Sub(c.pending.CreatedAt) < staleToolResultTimeout {
+		return false
+	}
+	c.resetProcess()
+	return true
+}
+
+func (c *cliClient) setPendingToolCall(requestID, sessionID string, call openAIToolCall) error {
+	fingerprint := call.Function.Name + "\n" + call.Function.Arguments
+	c.toolCalls++
+	if fingerprint == c.lastToolCall {
+		c.repeatedToolCall++
+	} else {
+		c.lastToolCall = fingerprint
+		c.repeatedToolCall = 1
+	}
+	if c.toolCalls > maxExternalToolCalls || c.repeatedToolCall > maxRepeatedToolCalls {
+		c.resetProcess()
+		return errors.New("external tool-call loop detected; the CLI session was reset")
+	}
+	c.pending = &pendingToolCall{
+		RequestID: requestID, SessionID: sessionID, ToolCallID: call.ID,
+		ToolName: call.Function.Name, CreatedAt: time.Now(),
+	}
+	return nil
 }
 
 func externalTools(tools []openAITool) []map[string]any {
@@ -261,9 +323,6 @@ func newToolCall(event cliEvent) openAIToolCall {
 func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, content []map[string]any, tools []openAITool, toolResult *chatMessage, onDelta func(string)) (cliChatResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if err := c.start(); err != nil {
-		return cliChatResult{}, err
-	}
 	id := ""
 	var request map[string]any
 	if toolResult != nil {
@@ -271,6 +330,9 @@ func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, c
 			return cliChatResult{}, errors.New("no pending tool call for tool result")
 		}
 		if c.pending.SessionID != sessionID || c.pending.ToolCallID != toolResult.ToolCallID {
+			if c.pending.SessionID == sessionID {
+				c.resetProcess()
+			}
 			return cliChatResult{}, errors.New("tool result does not match the pending session and tool_call_id")
 		}
 		id = c.pending.RequestID
@@ -280,7 +342,12 @@ func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, c
 		}
 	} else {
 		if c.pending != nil {
-			return cliChatResult{}, errors.New("another external tool call is waiting for its result")
+			if c.pending.SessionID != sessionID {
+				return cliChatResult{}, errors.New("another external tool call is waiting for its result")
+			}
+			// The same Agent resumed without returning the requested tool result.
+			// Its local run cannot safely continue, so start a clean headless process.
+			c.resetProcess()
 		}
 		id = fmt.Sprintf("req-%d", time.Now().UnixNano())
 		request = map[string]any{
@@ -291,6 +358,9 @@ func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, c
 		if len(content) > 0 {
 			request["message_content"] = content
 		}
+	}
+	if err := c.start(); err != nil {
+		return cliChatResult{}, err
 	}
 	data, _ := json.Marshal(request)
 	if _, err := c.stdin.Write(append(data, '\n')); err != nil {
@@ -320,19 +390,23 @@ func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, c
 				onDelta(event.Text)
 			}
 		case "result":
-			c.pending = nil
+			if toolResult != nil {
+				c.clearPendingTool()
+			} else {
+				c.clearToolState()
+			}
 			if event.Text != "" {
 				return cliChatResult{Text: event.Text}, nil
 			}
 			return cliChatResult{Text: streamed.String()}, nil
 		case "tool_call":
 			call := newToolCall(event)
-			c.pending = &pendingToolCall{
-				RequestID: id, SessionID: sessionID, ToolCallID: call.ID, ToolName: call.Function.Name,
+			if err := c.setPendingToolCall(id, sessionID, call); err != nil {
+				return cliChatResult{}, err
 			}
 			return cliChatResult{ToolCalls: []openAIToolCall{call}}, nil
 		case "error":
-			c.pending = nil
+			c.clearToolState()
 			return cliChatResult{}, errors.New(event.Message)
 		}
 	}
