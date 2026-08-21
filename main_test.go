@@ -120,8 +120,17 @@ func TestConversationRouterExplicitIDWins(t *testing.T) {
 	if got := router.resolve(request, "agent-session").ID; got != "agent-session" {
 		t.Fatalf("header session id = %q", got)
 	}
-	if got := router.resolve(request, "").ID; got != "user-request-user" {
-		t.Fatalf("user session id = %q", got)
+	if got := router.resolve(request, "").ID; got == "user-request-user" {
+		t.Fatalf("OpenAI user field was incorrectly used as a session id: %q", got)
+	}
+}
+
+func TestScopedSessionIDSeparatesModelsButKeepsSameModel(t *testing.T) {
+	if scopedSessionID(defaultModel, "agent") == scopedSessionID(mimoModel, "agent") {
+		t.Fatal("different models shared the same CLI session id")
+	}
+	if scopedSessionID(defaultModel, "agent") != scopedSessionID(defaultModel, "agent") {
+		t.Fatal("same model did not keep a stable CLI session id")
 	}
 }
 

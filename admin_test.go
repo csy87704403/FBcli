@@ -111,6 +111,26 @@ func TestRotateProxyAfterIPCapChoosesFastestOtherFullNode(t *testing.T) {
 	}
 }
 
+func TestRotateProxyAfterAdmissionChangesOnlyFailedAccount(t *testing.T) {
+	dir := t.TempDir()
+	store := &stateStore{path: filepath.Join(dir, "state.json"), state: gatewayState{
+		Accounts:      []accountConfig{{ID: "bad", Proxy: "current"}, {ID: "good", Proxy: "other"}},
+		SelectedProxy: "current",
+		Proxies:       []proxyNode{{Addr: "current", Mode: "full", Alive: true, TierLatencyMS: 10}, {Addr: "next", Mode: "full", Alive: true, TierLatencyMS: 20}, {Addr: "other", Mode: "full", Alive: true, TierLatencyMS: 30}},
+	}}
+	accounts := newAccountManager(store, "headless", "", dir, filepath.Join(dir, "accounts"))
+	admin := &adminService{store: store, server: &server{accounts: accounts}}
+	if !admin.rotateProxyAfterAdmission("bad") {
+		t.Fatal("admission failover did not find an exit")
+	}
+	if store.state.Accounts[0].Proxy != "next" || store.state.Accounts[1].Proxy != "other" {
+		t.Fatalf("account exits changed unexpectedly: %#v", store.state.Accounts)
+	}
+	if store.state.SelectedProxy != "current" {
+		t.Fatalf("global selected exit changed: %s", store.state.SelectedProxy)
+	}
+}
+
 func TestLoadMihomoListenerNames(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	config := "listeners:\n  - name: freebuff-node-53\n    type: mixed\n    port: 10053\n    proxy: \"🇸🇬VIP新加坡6\"\n  - name: freebuff-node-54\n    port: 10054\n    proxy: '🇺🇸美国2'\n"

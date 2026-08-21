@@ -15,17 +15,22 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 )
 
 type accountConfig struct {
-	ID        string    `json:"id"`
-	Label     string    `json:"label"`
-	ConfigDir string    `json:"config_dir"`
-	Enabled   bool      `json:"enabled"`
-	AddedAt   time.Time `json:"added_at"`
+	ID                     string               `json:"id"`
+	Label                  string               `json:"label"`
+	ConfigDir              string               `json:"config_dir"`
+	Proxy                  string               `json:"proxy,omitempty"`
+	AdmissionProxy         string               `json:"admission_proxy,omitempty"`
+	AdmissionCooldownUntil time.Time            `json:"admission_cooldown_until,omitempty"`
+	AdmissionCooldowns     map[string]time.Time `json:"admission_cooldowns,omitempty"`
+	Enabled                bool                 `json:"enabled"`
+	AddedAt                time.Time            `json:"added_at"`
 }
 
 type accountCredential struct {
@@ -81,13 +86,14 @@ type portableAccountBundle struct {
 func ensureDefaultAccount(store *stateStore, configDir string) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if len(store.state.Accounts) > 0 {
+	if store.state.DefaultAccountChecked || len(store.state.Accounts) > 0 {
 		return nil
 	}
 	credential := readAccountCredential(configDir)
 	if !credential.Authenticated {
 		return nil
 	}
+	store.state.DefaultAccountChecked = true
 	store.state.Accounts = []accountConfig{{
 		ID: "account-default", Label: credential.Label, ConfigDir: configDir,
 		Enabled: true, AddedAt: time.Now(),
@@ -96,14 +102,21 @@ func ensureDefaultAccount(store *stateStore, configDir string) error {
 }
 
 type accountRuntime struct {
-	config        accountConfig
-	client        *cliClient
-	active        int
-	activeModel   string
-	lastUsed      time.Time
-	lastError     string
-	cooldownUntil time.Time
+	config            accountConfig
+	client            *cliClient
+	active            int
+	activeModel       string
+	lastUsed          time.Time
+	lastError         string
+	cooldownUntil     time.Time
+	admissionCooldown map[string]time.Time
+	reconfiguring     bool
 }
+
+const (
+	admissionCooldown = 10 * time.Minute
+	accountCooldown   = 5 * time.Minute
+)
 
 type accountSessionBinding struct {
 	AccountID string    `json:"account_id"`
@@ -148,9 +161,22 @@ func newAccountManager(store *stateStore, cliPath, loginCLIPath, cwd, accountsRo
 	}
 	store.mu.RUnlock()
 	for _, config := range configs {
+		if config.Proxy == "" {
+			config.Proxy = proxy
+		}
+		cooldowns := make(map[string]time.Time)
+		for proxy, until := range config.AdmissionCooldowns {
+			if until.After(time.Now()) {
+				cooldowns[proxy] = until
+			}
+		}
+		if config.AdmissionProxy != "" && config.AdmissionCooldownUntil.After(time.Now()) {
+			cooldowns[config.AdmissionProxy] = config.AdmissionCooldownUntil
+		}
 		manager.runtimes[config.ID] = &accountRuntime{
-			config: config,
-			client: &cliClient{path: cliPath, cwd: cwd, configDir: config.ConfigDir, proxy: proxy},
+			config:            config,
+			client:            &cliClient{path: cliPath, cwd: cwd, configDir: config.ConfigDir, proxy: config.Proxy},
+			admissionCooldown: cooldowns,
 		}
 	}
 	cutoff := time.Now().Add(-sessionBindingTTL)
@@ -171,9 +197,16 @@ func (m *accountManager) reapIdleProcesses() {
 		cutoff := time.Now().Add(-sessionBindingTTL)
 		bindingsChanged := false
 		m.mu.Lock()
-		for _, runtime := range m.runtimes {
+		for accountID, runtime := range m.runtimes {
 			runtime.client.recoverExpiredToolCall(time.Now())
-			if runtime.active == 0 && !runtime.lastUsed.IsZero() && time.Since(runtime.lastUsed) >= 10*time.Minute {
+			hasBinding := false
+			for _, binding := range m.sessionAccounts {
+				if binding.AccountID == accountID {
+					hasBinding = true
+					break
+				}
+			}
+			if runtime.active == 0 && !hasBinding && !runtime.lastUsed.IsZero() && time.Since(runtime.lastUsed) >= time.Minute {
 				clients = append(clients, runtime.client)
 			}
 		}
@@ -215,6 +248,7 @@ func modelAffinityRank(activeModel, requestedModel string) int {
 
 func (m *accountManager) acquire(sessionID, requestedModel string) (*cliClient, string, error) {
 	rawSessionID := sessionID
+	cliSessionID := scopedSessionID(requestedModel, rawSessionID)
 	sessionID = accountSessionKey(rawSessionID)
 	m.mu.Lock()
 	if m.configuring {
@@ -224,16 +258,25 @@ func (m *accountManager) acquire(sessionID, requestedModel string) (*cliClient, 
 	now := time.Now()
 	if binding, found := m.sessionAccounts[sessionID]; found && binding.Updated.After(now.Add(-sessionBindingTTL)) {
 		runtime := m.runtimes[binding.AccountID]
-		if runtime == nil || !runtime.config.Enabled || !readAccountCredential(runtime.config.ConfigDir).Authenticated {
+		if runtime == nil || runtime.reconfiguring || !runtime.config.Enabled || !readAccountCredential(runtime.config.ConfigDir).Authenticated {
 			m.mu.Unlock()
 			return nil, "", errors.New("conversation account is unavailable")
 		}
-		if runtime.cooldownUntil.After(now) {
+		admissionUntil := runtime.admissionCooldown[runtime.config.Proxy]
+		if runtime.cooldownUntil.After(now) || admissionUntil.After(now) {
 			m.mu.Unlock()
-			return nil, "", fmt.Errorf("conversation account is cooling down until %s", runtime.cooldownUntil.Format(time.RFC3339))
+			until := runtime.cooldownUntil
+			if admissionUntil.After(until) {
+				until = admissionUntil
+			}
+			return nil, "", fmt.Errorf("conversation account is cooling down until %s", until.Format(time.RFC3339))
+		}
+		if runtime.active > 0 {
+			m.mu.Unlock()
+			return nil, "", errors.New("conversation account is busy")
 		}
 		runtime.client.recoverExpiredToolCall(now)
-		if pendingSession := runtime.client.pendingSession(); pendingSession != "" && pendingSession != rawSessionID {
+		if pendingSession := runtime.client.pendingSession(); pendingSession != "" && pendingSession != cliSessionID {
 			m.mu.Unlock()
 			return nil, "", errors.New("conversation account is waiting for another session's tool result")
 		}
@@ -241,20 +284,20 @@ func (m *accountManager) acquire(sessionID, requestedModel string) (*cliClient, 
 		binding.Updated = now
 		m.sessionAccounts[sessionID] = binding
 		m.mu.Unlock()
-		m.persistAccountSession(sessionID, binding, false)
+		m.persistAccountSession(sessionID, binding, true)
 		return runtime.client, binding.AccountID, nil
 	}
 	delete(m.sessionAccounts, sessionID)
 	var selected *accountRuntime
 	for _, runtime := range m.runtimes {
 		runtime.client.recoverExpiredToolCall(now)
-		if !runtime.config.Enabled || runtime.cooldownUntil.After(now) {
+		if runtime.reconfiguring || !runtime.config.Enabled || runtime.active > 0 || runtime.cooldownUntil.After(now) || runtime.admissionCooldown[runtime.config.Proxy].After(now) {
 			continue
 		}
 		if !readAccountCredential(runtime.config.ConfigDir).Authenticated {
 			continue
 		}
-		if pendingSession := runtime.client.pendingSession(); pendingSession != "" && pendingSession != rawSessionID {
+		if pendingSession := runtime.client.pendingSession(); pendingSession != "" && pendingSession != cliSessionID {
 			continue
 		}
 		if selected == nil || runtime.active < selected.active ||
@@ -339,13 +382,163 @@ func (m *accountManager) finish(accountID, model, sessionID string, requestErr e
 	}
 }
 
+func isSessionAdmissionFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "session admission returned banned") ||
+		strings.Contains(lower, "session admission returned") && strings.Contains(lower, "banned")
+}
+
+func (m *accountManager) markAdmissionFailure(accountID string) {
+	now := time.Now()
+	m.mu.Lock()
+	runtime := m.runtimes[accountID]
+	var config accountConfig
+	if runtime != nil {
+		if runtime.admissionCooldown == nil {
+			runtime.admissionCooldown = make(map[string]time.Time)
+		}
+		until := now.Add(admissionCooldown)
+		runtime.admissionCooldown[runtime.config.Proxy] = until
+		runtime.config.AdmissionProxy = runtime.config.Proxy
+		runtime.config.AdmissionCooldownUntil = until
+		if runtime.config.AdmissionCooldowns == nil {
+			runtime.config.AdmissionCooldowns = make(map[string]time.Time)
+		}
+		runtime.config.AdmissionCooldowns[runtime.config.Proxy] = until
+		config = runtime.config
+		runtime.lastError = "Freebuff session admission returned banned"
+	}
+	m.mu.Unlock()
+	if runtime == nil {
+		return
+	}
+	m.store.mu.Lock()
+	for index := range m.store.state.Accounts {
+		if m.store.state.Accounts[index].ID == accountID {
+			m.store.state.Accounts[index].AdmissionProxy = config.AdmissionProxy
+			m.store.state.Accounts[index].AdmissionCooldownUntil = config.AdmissionCooldownUntil
+			m.store.state.Accounts[index].AdmissionCooldowns = config.AdmissionCooldowns
+			break
+		}
+	}
+	err := m.store.saveLocked()
+	m.store.mu.Unlock()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "persist admission cooldown: %v\n", err)
+	}
+}
+
+func (m *accountManager) coolAccount(accountID string) {
+	m.mu.Lock()
+	if runtime := m.runtimes[accountID]; runtime != nil {
+		runtime.cooldownUntil = time.Now().Add(accountCooldown)
+	}
+	m.mu.Unlock()
+}
+
+func (m *accountManager) setAccountProxy(accountID, proxy string) bool {
+	m.mu.Lock()
+	runtime := m.runtimes[accountID]
+	if runtime == nil || runtime.reconfiguring || runtime.active > 0 || runtime.client.pendingSession() != "" {
+		m.mu.Unlock()
+		return false
+	}
+	if runtime.config.Proxy == proxy {
+		m.mu.Unlock()
+		return true
+	}
+	previousProxy := runtime.config.Proxy
+	runtime.reconfiguring = true
+	runtime.config.Proxy = proxy
+	client := runtime.client
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		if current := m.runtimes[accountID]; current != nil {
+			current.reconfiguring = false
+		}
+		m.mu.Unlock()
+	}()
+
+	m.store.mu.Lock()
+	for index := range m.store.state.Accounts {
+		if m.store.state.Accounts[index].ID == accountID {
+			m.store.state.Accounts[index].Proxy = proxy
+			break
+		}
+	}
+	err := m.store.saveLocked()
+	if err != nil {
+		for index := range m.store.state.Accounts {
+			if m.store.state.Accounts[index].ID == accountID {
+				m.store.state.Accounts[index].Proxy = previousProxy
+				break
+			}
+		}
+	}
+	m.store.mu.Unlock()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "persist account proxy: %v\n", err)
+		m.mu.Lock()
+		if current := m.runtimes[accountID]; current != nil {
+			current.config.Proxy = previousProxy
+		}
+		m.mu.Unlock()
+		return false
+	}
+	client.setProxy(proxy)
+	return true
+}
+
+// reconcileFullProxies gives idle accounts independent low-latency FULL exits.
+// It never moves an active or tool-waiting account, because that would break a
+// caller's current tool chain.
+func (m *accountManager) reconcileFullProxies(nodes []proxyNode) {
+	now := time.Now()
+	full := make([]proxyNode, 0, len(nodes))
+	for _, node := range nodes {
+		if node.Mode == "full" && node.Alive && !node.CooldownUntil.After(now) {
+			full = append(full, node)
+		}
+	}
+	if len(full) == 0 {
+		return
+	}
+	sort.SliceStable(full, func(i, j int) bool { return full[i].TierLatencyMS < full[j].TierLatencyMS })
+	m.mu.Lock()
+	accountIDs := make([]string, 0, len(m.runtimes))
+	for accountID, runtime := range m.runtimes {
+		if runtime.active == 0 && runtime.client.pendingSession() == "" {
+			accountIDs = append(accountIDs, accountID)
+		}
+	}
+	m.mu.Unlock()
+	sort.Strings(accountIDs)
+	for index, accountID := range accountIDs {
+		m.setAccountProxy(accountID, full[index%len(full)].Addr)
+	}
+}
+
 func (m *accountManager) setProxy(proxy string) {
 	m.mu.Lock()
 	clients := make([]*cliClient, 0, len(m.runtimes))
 	for _, runtime := range m.runtimes {
+		runtime.config.Proxy = proxy
 		clients = append(clients, runtime.client)
 	}
 	m.mu.Unlock()
+	m.store.mu.Lock()
+	for index := range m.store.state.Accounts {
+		m.store.state.Accounts[index].Proxy = proxy
+	}
+	err := m.store.saveLocked()
+	m.store.mu.Unlock()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "persist global account proxy: %v\n", err)
+	}
 	for _, client := range clients {
 		client.setProxy(proxy)
 	}
@@ -417,15 +610,25 @@ func (m *accountManager) snapshots(selectedProxy string) []map[string]any {
 		}
 		result = append(result, map[string]any{
 			"id": runtime.config.ID, "label": credential.Label, "authenticated": credential.Authenticated,
-			"enabled": runtime.config.Enabled, "status": status, "current_exit": selectedProxy,
+			"enabled": runtime.config.Enabled, "status": status, "current_exit": firstNonEmpty(runtime.config.Proxy, selectedProxy),
 			"active_sessions": boundSessions[runtime.config.ID], "active_requests": runtime.active,
 			"cli_open": cliOpen, "cli_pid": cliPID, "cli_started_at": cliStartedAt,
 			"models": len(gatewayModels), "last_error": runtime.lastError,
 			"active_model": runtime.activeModel,
 			"last_at":      runtime.lastUsed, "cooldown_until": runtime.cooldownUntil,
+			"admission_proxy": runtime.config.AdmissionProxy, "admission_cooldown_until": runtime.config.AdmissionCooldownUntil,
 		})
 	}
 	return result
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func (m *accountManager) exportPortableAccounts() (portableAccountBundle, error) {
@@ -574,9 +777,13 @@ func (m *accountManager) importPortableAccounts(bundle portableAccountBundle) (i
 			stopClients = append(stopClients, runtime.client)
 			continue
 		}
+		if write.config.Proxy == "" {
+			write.config.Proxy = selectedProxy
+		}
 		m.runtimes[write.config.ID] = &accountRuntime{
-			config: write.config,
-			client: &cliClient{path: m.cliPath, cwd: m.cwd, configDir: write.config.ConfigDir, proxy: selectedProxy},
+			config:            write.config,
+			client:            &cliClient{path: m.cliPath, cwd: m.cwd, configDir: write.config.ConfigDir, proxy: write.config.Proxy},
+			admissionCooldown: make(map[string]time.Time),
 		}
 	}
 	m.mu.Unlock()
@@ -617,6 +824,80 @@ func (m *accountManager) toggle(accountID string, enabled bool) error {
 	return nil
 }
 
+// remove stops and deregisters an account without deleting its credential directory.
+// Credentials are intentionally retained so an operator can recover them manually.
+func (m *accountManager) remove(accountID string) error {
+	if accountID == "" {
+		return errors.New("account id is required")
+	}
+	m.mu.Lock()
+	if m.configuring {
+		m.mu.Unlock()
+		return errors.New("account configuration is being updated")
+	}
+	runtime := m.runtimes[accountID]
+	if runtime == nil {
+		m.mu.Unlock()
+		return errors.New("account not found")
+	}
+	if runtime.active > 0 {
+		m.mu.Unlock()
+		return errors.New("cannot remove account while requests are active")
+	}
+	m.configuring = true
+	delete(m.runtimes, accountID)
+	for sessionID, binding := range m.sessionAccounts {
+		if binding.AccountID == accountID {
+			delete(m.sessionAccounts, sessionID)
+		}
+	}
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		m.configuring = false
+		m.mu.Unlock()
+	}()
+
+	// Stop first so no already-idle process can continue using the removed account.
+	runtime.client.stop()
+	m.store.mu.Lock()
+	previousAccounts := append([]accountConfig(nil), m.store.state.Accounts...)
+	previousBindings := make(map[string]accountSessionBinding, len(m.store.state.AccountSessions))
+	for sessionID, binding := range m.store.state.AccountSessions {
+		previousBindings[sessionID] = binding
+	}
+	previousDefaultCheck := m.store.state.DefaultAccountChecked
+	configs := make([]accountConfig, 0, len(m.store.state.Accounts)-1)
+	for _, config := range m.store.state.Accounts {
+		if config.ID != accountID {
+			configs = append(configs, config)
+		}
+	}
+	m.store.state.Accounts = configs
+	m.store.state.DefaultAccountChecked = true
+	for sessionID, binding := range m.store.state.AccountSessions {
+		if binding.AccountID == accountID {
+			delete(m.store.state.AccountSessions, sessionID)
+		}
+	}
+	err := m.store.saveLocked()
+	if err != nil {
+		m.store.state.Accounts = previousAccounts
+		m.store.state.AccountSessions = previousBindings
+		m.store.state.DefaultAccountChecked = previousDefaultCheck
+	}
+	m.store.mu.Unlock()
+	if err != nil {
+		// Keep the runtime usable if state persistence fails; the next restart
+		// reloads the last known-good state file.
+		m.mu.Lock()
+		m.runtimes[accountID] = runtime
+		m.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
 func newAccountID() string {
 	var raw [8]byte
 	_, _ = cryptorand.Read(raw[:])
@@ -644,7 +925,8 @@ func (m *accountManager) registerAccount(configDir string) error {
 		return err
 	}
 	m.mu.Lock()
-	m.runtimes[config.ID] = &accountRuntime{config: config, client: &cliClient{path: m.cliPath, cwd: m.cwd, configDir: configDir, proxy: proxy}}
+	config.Proxy = proxy
+	m.runtimes[config.ID] = &accountRuntime{config: config, client: &cliClient{path: m.cliPath, cwd: m.cwd, configDir: configDir, proxy: proxy}, admissionCooldown: make(map[string]time.Time)}
 	m.mu.Unlock()
 	return nil
 }

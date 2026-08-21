@@ -57,14 +57,15 @@ type usageRecord struct {
 }
 
 type gatewayState struct {
-	APIKeys              []string                         `json:"api_keys"`
-	Accounts             []accountConfig                  `json:"accounts,omitempty"`
-	AccountSessions      map[string]accountSessionBinding `json:"account_sessions,omitempty"`
-	ConversationSessions map[string]sessionBinding        `json:"conversation_sessions,omitempty"`
-	Proxies              []proxyNode                      `json:"proxies"`
-	SelectedProxy        string                           `json:"selected_proxy,omitempty"`
-	EgressTier           egressTierStatus                 `json:"egress_tier,omitempty"`
-	Usage                []usageRecord                    `json:"usage,omitempty"`
+	APIKeys               []string                         `json:"api_keys"`
+	Accounts              []accountConfig                  `json:"accounts,omitempty"`
+	DefaultAccountChecked bool                             `json:"default_account_checked,omitempty"`
+	AccountSessions       map[string]accountSessionBinding `json:"account_sessions,omitempty"`
+	ConversationSessions  map[string]sessionBinding        `json:"conversation_sessions,omitempty"`
+	Proxies               []proxyNode                      `json:"proxies"`
+	SelectedProxy         string                           `json:"selected_proxy,omitempty"`
+	EgressTier            egressTierStatus                 `json:"egress_tier,omitempty"`
+	Usage                 []usageRecord                    `json:"usage,omitempty"`
 }
 
 type stateStore struct {
@@ -242,6 +243,7 @@ func (a *adminService) register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/webui/accounts/login/status", a.auth.require(a.accountLoginStatus))
 	mux.HandleFunc("POST /api/webui/accounts/login/cancel", a.auth.require(a.cancelAccountLogin))
 	mux.HandleFunc("POST /api/webui/accounts/toggle", a.auth.require(a.toggleAccount))
+	mux.HandleFunc("POST /api/webui/accounts/delete", a.auth.require(a.deleteAccount))
 	mux.HandleFunc("GET /api/webui/accounts/config", a.auth.require(a.accountConfig))
 	mux.HandleFunc("POST /api/webui/accounts/config", a.auth.require(a.saveAccountConfig))
 	mux.HandleFunc("GET /api/webui/apis", a.auth.require(a.listAPIKeys))
@@ -425,6 +427,21 @@ func (a *adminService) toggleAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := a.server.accounts.toggle(strings.TrimSpace(request.ID), request.Enabled); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error(), "account_update_failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (a *adminService) deleteAccount(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		ID string `json:"id"`
+	}
+	if json.NewDecoder(r.Body).Decode(&request) != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON request", "invalid_request")
+		return
+	}
+	if err := a.server.accounts.remove(strings.TrimSpace(request.ID)); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "account_delete_failed")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -784,8 +801,8 @@ func (a *adminService) scanProxyPool(ctx context.Context, forceLowest bool) ([]p
 	if err != nil {
 		return nil, "", egressTierStatus{}, 0, err
 	}
-	if selected != previousSelected && a.server != nil && a.server.accounts != nil {
-		a.server.accounts.setProxy(selected)
+	if a.server != nil && a.server.accounts != nil {
+		a.server.accounts.reconcileFullProxies(nodes)
 	}
 	return nodes, selected, selectedTier, fullCount, nil
 }
@@ -990,7 +1007,7 @@ func (a *adminService) selectProxy(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "selected": request.Addr, "egress_tier": status})
 }
 
-func (a *adminService) rotateProxyAfterIPCap() bool {
+func (a *adminService) rotateProxyAfterIPCap(accountIDs ...string) bool {
 	a.proxyFailoverMu.Lock()
 	defer a.proxyFailoverMu.Unlock()
 	a.proxyScanMu.Lock()
@@ -999,6 +1016,16 @@ func (a *adminService) rotateProxyAfterIPCap() bool {
 	now := time.Now()
 	a.store.mu.Lock()
 	current := a.store.state.SelectedProxy
+	accountID := ""
+	if len(accountIDs) > 0 {
+		accountID = strings.TrimSpace(accountIDs[0])
+		for _, account := range a.store.state.Accounts {
+			if account.ID == accountID && account.Proxy != "" {
+				current = account.Proxy
+				break
+			}
+		}
+	}
 	if current == "" {
 		a.store.mu.Unlock()
 		return false
@@ -1026,10 +1053,12 @@ func (a *adminService) rotateProxyAfterIPCap() bool {
 		return false
 	}
 	next := a.store.state.Proxies[best].Addr
-	a.store.state.SelectedProxy = next
-	a.store.state.EgressTier = egressTierStatus{
-		Tier: a.store.state.Proxies[best].Mode, Detail: a.store.state.Proxies[best].TierDetail,
-		CheckedAt: a.store.state.Proxies[best].TierCheckedAt, LatencyMS: a.store.state.Proxies[best].TierLatencyMS,
+	if accountID == "" {
+		a.store.state.SelectedProxy = next
+		a.store.state.EgressTier = egressTierStatus{
+			Tier: a.store.state.Proxies[best].Mode, Detail: a.store.state.Proxies[best].TierDetail,
+			CheckedAt: a.store.state.Proxies[best].TierCheckedAt, LatencyMS: a.store.state.Proxies[best].TierLatencyMS,
+		}
 	}
 	err := a.store.saveLocked()
 	a.store.mu.Unlock()
@@ -1038,8 +1067,63 @@ func (a *adminService) rotateProxyAfterIPCap() bool {
 		return false
 	}
 	if a.server != nil && a.server.accounts != nil {
-		a.server.accounts.setProxy(next)
+		if accountID != "" {
+			if !a.server.accounts.setAccountProxy(accountID, next) {
+				return false
+			}
+		} else {
+			a.server.accounts.setProxy(next)
+		}
 	}
-	log.Printf("rotated Freebuff exit after ip_capped: %s -> %s", current, next)
+	log.Printf("rotated Freebuff exit after ip_capped: account=%s %s -> %s", accountID, current, next)
 	return true
+}
+
+// rotateProxyAfterAdmission changes only the failing account's exit.  A
+// controller rejection is scoped to an account+exit pair, so other accounts
+// keep their own working CLI session and tool chain.
+func (a *adminService) rotateProxyAfterAdmission(accountID string) bool {
+	if a == nil || a.server == nil || a.server.accounts == nil || accountID == "" {
+		return false
+	}
+	a.proxyFailoverMu.Lock()
+	defer a.proxyFailoverMu.Unlock()
+	now := time.Now()
+	a.store.mu.Lock()
+	current := ""
+	for _, account := range a.store.state.Accounts {
+		if account.ID == accountID {
+			current = account.Proxy
+			break
+		}
+	}
+	if current == "" {
+		current = a.store.state.SelectedProxy
+	}
+	best := -1
+	for index := range a.store.state.Proxies {
+		node := &a.store.state.Proxies[index]
+		if node.Addr == current {
+			continue
+		}
+		if node.Mode != "full" || !node.Alive || node.CooldownUntil.After(now) {
+			continue
+		}
+		if best == -1 || node.TierLatencyMS < a.store.state.Proxies[best].TierLatencyMS {
+			best = index
+		}
+	}
+	next := ""
+	if best >= 0 {
+		next = a.store.state.Proxies[best].Addr
+	}
+	err := a.store.saveLocked()
+	a.store.mu.Unlock()
+	if err != nil {
+		log.Printf("persist admission failover: %v", err)
+	}
+	if next == "" {
+		return false
+	}
+	return a.server.accounts.setAccountProxy(accountID, next)
 }

@@ -31,7 +31,7 @@ const (
 	// An external tool result normally arrives immediately after a tool call. These
 	// limits turn a broken Agent tool loop into a recoverable request failure rather
 	// than leaving its account process permanently occupied.
-	staleToolResultTimeout = 3 * time.Minute
+	staleToolResultTimeout = 2 * time.Minute
 	maxExternalToolCalls   = 48
 	maxRepeatedToolCalls   = 5
 	maxGatewayRequestTime  = 12 * time.Minute
@@ -396,7 +396,12 @@ func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, c
 	} else {
 		if c.pending != nil {
 			if c.pending.SessionID != sessionID {
-				return cliChatResult{}, errors.New("another external tool call is waiting for its result")
+				// The account scheduler must never route a second session into a
+				// pending tool chain. If it still happens, the child state is no
+				// longer trustworthy; reset it so this account cannot poison every
+				// later request until an operator restarts the gateway.
+				c.resetProcess()
+				return cliChatResult{}, errors.New("headless CLI reset: another external tool call was waiting for its result")
 			}
 			// The same Agent resumed without returning the requested tool result.
 			// Its local run cannot safely continue, so start a clean headless process.
@@ -627,9 +632,11 @@ func explicitSessionID(request chatRequest, header string) string {
 	if value := strings.TrimSpace(header); value != "" {
 		return value
 	}
-	if value := strings.TrimSpace(request.User); value != "" {
-		return "user-" + value
-	}
+	// OpenAI's `user` is an end-user label, not a conversation identifier.
+	// Hermes commonly sends a stable user value across unrelated tasks; using it
+	// as a session key would merge those tasks and repeatedly disturb the
+	// official CLI admission/session state. Callers that have a real stable
+	// conversation id should use X-Freebuff-Session-ID.
 	return ""
 }
 
@@ -639,6 +646,15 @@ func newAutoSessionID() string {
 		return "auto-" + hex.EncodeToString(random[:])
 	}
 	return fmt.Sprintf("auto-%d", time.Now().UnixNano())
+}
+
+func scopedSessionID(model, raw string) string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = defaultModel
+	}
+	sum := sha256.Sum256([]byte(model + "\x00" + raw))
+	return "session-" + hex.EncodeToString(sum[:16])
 }
 
 func firstUserText(messages []chatMessage) string {
@@ -705,8 +721,11 @@ func historyKeyForResult(request chatRequest, result cliChatResult) (string, boo
 }
 
 const (
-	sessionBindingTTL   = 24 * time.Hour
-	maxToolCallBindings = 4096
+	// A remote agent may keep an active conversation for a while, but retaining
+	// bindings for a whole day creates stale CLI context and artificial load.
+	sessionBindingTTL   = 30 * time.Minute
+	maxToolCallBindings = 512
+	maxHistoryBindings  = 512
 )
 
 func newConversationRouter(stores ...*stateStore) *conversationRouter {
@@ -786,7 +805,7 @@ func (router *conversationRouter) reapExpired() {
 	}
 }
 
-func (router *conversationRouter) resolve(request chatRequest, header string) sessionSelection {
+func (router *conversationRouter) resolve(request chatRequest, header string, models ...string) sessionSelection {
 	if explicit := explicitSessionID(request, header); explicit != "" {
 		return sessionSelection{ID: explicit}
 	}
@@ -809,7 +828,7 @@ func (router *conversationRouter) resolve(request chatRequest, header string) se
 	if binding, ok := router.byHistory[key]; ok && binding.ID != "" {
 		binding.Updated = time.Now()
 		router.byHistory[key] = binding
-		router.persist(key, binding, false)
+		router.persist(key, binding, true)
 		return sessionSelection{ID: binding.ID, Automatic: true}
 	}
 	return sessionSelection{ID: newAutoSessionID(), Automatic: true}
@@ -822,6 +841,41 @@ func (router *conversationRouter) completeToolResult(toolCallID string) {
 	router.mu.Lock()
 	delete(router.byToolCall, toolCallID)
 	router.mu.Unlock()
+}
+
+// forget removes all automatic routes pointing at a failed CLI session.  A
+// restarted headless process no longer owns that in-memory run, so retaining
+// the route would only make the next request resume broken context.
+func (router *conversationRouter) forget(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	router.mu.Lock()
+	removedHistory := make([]string, 0)
+	for key, binding := range router.byHistory {
+		if binding.ID == sessionID {
+			delete(router.byHistory, key)
+			removedHistory = append(removedHistory, key)
+		}
+	}
+	for toolCallID, binding := range router.byToolCall {
+		if binding.ID == sessionID {
+			delete(router.byToolCall, toolCallID)
+		}
+	}
+	router.mu.Unlock()
+	if router.store == nil || len(removedHistory) == 0 {
+		return
+	}
+	router.store.mu.Lock()
+	for _, key := range removedHistory {
+		delete(router.store.state.ConversationSessions, key)
+	}
+	err := router.store.saveLocked()
+	router.store.mu.Unlock()
+	if err != nil {
+		log.Printf("remove failed conversation routes: %v", err)
+	}
 }
 
 func (router *conversationRouter) bind(request chatRequest, result cliChatResult, selection sessionSelection) {
@@ -838,6 +892,8 @@ func (router *conversationRouter) bind(request chatRequest, result cliChatResult
 	router.mu.Lock()
 	if found {
 		if existing, ok := router.byHistory[key]; ok && existing.ID != selection.ID {
+			// The same shortened history can belong to more than one conversation.
+			// Fail closed rather than attaching one agent run to another's context.
 			binding := sessionBinding{Updated: time.Now()}
 			router.byHistory[key] = binding
 			router.mu.Unlock()
@@ -864,7 +920,7 @@ func (router *conversationRouter) bind(request chatRequest, result cliChatResult
 		}
 		delete(router.byToolCall, oldestID)
 	}
-	if len(router.byHistory) <= 4096 {
+	if len(router.byHistory) <= maxHistoryBindings {
 		router.mu.Unlock()
 		if found {
 			router.persist(key, binding, true)
@@ -930,21 +986,55 @@ func isIPCapError(err error) bool {
 	return err != nil && strings.Contains(strings.ToLower(err.Error()), "ip_capped")
 }
 
+func isRecoverableCLIError(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "another external tool call is waiting") ||
+		strings.Contains(lower, "headless cli closed its output") ||
+		strings.Contains(lower, "headless cli exited before ready") ||
+		strings.Contains(lower, "headless cli did not become ready") ||
+		strings.Contains(lower, "model_locked") || strings.Contains(lower, "session is locked to") ||
+		strings.Contains(lower, "broken pipe") ||
+		strings.Contains(lower, "unexpected eof")
+}
+
 func (s *server) chatWithIPCapFailover(ctx context.Context, model string, selection sessionSelection, prompt string, content []map[string]any, tools []openAITool, toolResult *chatMessage, onDelta func(string), canRetry func() bool) (cliChatResult, error) {
 	client, accountID, err := s.accounts.acquire(selection.ID, model)
 	if err != nil {
 		return cliChatResult{}, err
 	}
-	result, err := client.chat(ctx, model, selection.ID, prompt, content, tools, toolResult, onDelta)
+	result, err := client.chat(ctx, model, scopedSessionID(model, selection.ID), prompt, content, tools, toolResult, onDelta)
 	s.accounts.finish(accountID, model, selection.ID, err)
-	if !isIPCapError(err) || (canRetry != nil && !canRetry()) || s.admin == nil || !s.admin.rotateProxyAfterIPCap() {
+	if err == nil || (canRetry != nil && !canRetry()) {
+		return result, err
+	}
+	if isSessionAdmissionFailure(err) {
+		s.accounts.markAdmissionFailure(accountID)
+		if s.admin == nil || !s.admin.rotateProxyAfterAdmission(accountID) {
+			s.accounts.coolAccount(accountID)
+		}
+	} else if isIPCapError(err) {
+		if s.admin == nil || !s.admin.rotateProxyAfterIPCap(accountID) {
+			return result, err
+		}
+	} else if isRecoverableCLIError(err) {
+		// chat() already terminated its broken process in the output/start paths.
+		// A waiting external-tool state needs an explicit reset before retrying a
+		// plain chat request; never replay a tool-result callback.
+		if toolResult != nil {
+			return result, err
+		}
+		client.stop()
+	} else {
 		return result, err
 	}
 	client, accountID, retryAcquireErr := s.accounts.acquire(selection.ID, model)
 	if retryAcquireErr != nil {
 		return cliChatResult{}, retryAcquireErr
 	}
-	result, err = client.chat(ctx, model, selection.ID, prompt, content, tools, toolResult, onDelta)
+	result, err = client.chat(ctx, model, scopedSessionID(model, selection.ID), prompt, content, tools, toolResult, onDelta)
 	s.accounts.finish(accountID, model, selection.ID, err)
 	return result, err
 }
@@ -975,7 +1065,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	id := fmt.Sprintf("chatcmpl-cli-%d", time.Now().UnixNano())
 	created := time.Now().Unix()
-	selection := s.sessions.resolve(request, r.Header.Get("X-Freebuff-Session-ID"))
+	selection := s.sessions.resolve(request, r.Header.Get("X-Freebuff-Session-ID"), model)
 	inputChars := len(prompt)
 	requestContext, cancel := context.WithTimeout(r.Context(), maxGatewayRequestTime)
 	defer cancel()
@@ -1004,6 +1094,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		result, err := s.chatWithIPCapFailover(requestContext, model, selection, prompt, content, request.Tools, toolResult, onDelta, func() bool { return toolResult == nil && outputChars == 0 })
 		if err != nil {
+			s.sessions.forget(selection.ID)
 			s.admin.recordUsage(model, apiKeyFromRequest(r), inputChars, outputChars, false, time.Since(startedAt), err)
 			_, errorType := upstreamErrorStatus(err.Error())
 			data, _ := json.Marshal(map[string]any{"error": map[string]any{"message": err.Error(), "type": errorType}})
@@ -1036,6 +1127,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.chatWithIPCapFailover(requestContext, model, selection, prompt, content, request.Tools, toolResult, nil, func() bool { return toolResult == nil })
 	if err != nil {
+		s.sessions.forget(selection.ID)
 		if strings.Contains(err.Error(), "no authenticated account") || strings.Contains(err.Error(), "conversation account") || strings.Contains(err.Error(), "cooling down") {
 			writeError(w, http.StatusServiceUnavailable, err.Error(), "account_unavailable")
 			return

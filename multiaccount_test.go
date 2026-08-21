@@ -61,6 +61,47 @@ func TestPortableAccountImportRejectsActiveRequests(t *testing.T) {
 	}
 }
 
+func TestRemoveAccountDeregistersWithoutDeletingCredentials(t *testing.T) {
+	dir := t.TempDir()
+	accountDir := filepath.Join(dir, "account-one")
+	writeTestCredential(t, accountDir, "remove@example.com")
+	store := &stateStore{path: filepath.Join(dir, "state.json"), state: gatewayState{
+		Accounts:        []accountConfig{{ID: "account-one", ConfigDir: accountDir, Enabled: true}},
+		AccountSessions: map[string]accountSessionBinding{"session": {AccountID: "account-one", Updated: time.Now()}},
+	}}
+	manager := newAccountManager(store, "headless", "", dir, filepath.Join(dir, "accounts"))
+	manager.sessionAccounts["session"] = accountSessionBinding{AccountID: "account-one", Updated: time.Now()}
+	if err := manager.remove("account-one"); err != nil {
+		t.Fatal(err)
+	}
+	if manager.count() != 0 || len(store.state.Accounts) != 0 || len(store.state.AccountSessions) != 0 {
+		t.Fatalf("account was not fully deregistered: runtimes=%d accounts=%d bindings=%d", manager.count(), len(store.state.Accounts), len(store.state.AccountSessions))
+	}
+	if _, err := os.Stat(filepath.Join(accountDir, "credentials.json")); err != nil {
+		t.Fatalf("credentials were unexpectedly removed: %v", err)
+	}
+}
+
+func TestDefaultAccountIsNotReimportedAfterRemoval(t *testing.T) {
+	dir := t.TempDir()
+	defaultDir := filepath.Join(dir, "default")
+	writeTestCredential(t, defaultDir, "default@example.com")
+	store := &stateStore{path: filepath.Join(dir, "state.json")}
+	if err := ensureDefaultAccount(store, defaultDir); err != nil {
+		t.Fatal(err)
+	}
+	manager := newAccountManager(store, "headless", "", dir, filepath.Join(dir, "accounts"))
+	if err := manager.remove("account-default"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureDefaultAccount(store, defaultDir); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.state.Accounts) != 0 {
+		t.Fatal("removed default account was imported again")
+	}
+}
+
 func writeTestCredential(t *testing.T, dir, email string) {
 	t.Helper()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -152,6 +193,46 @@ func TestAccountSchedulerSkipsAccountWaitingForAnotherToolResult(t *testing.T) {
 	manager.finish(accountID, defaultModel, "new-session", nil)
 	if accountID != "two" {
 		t.Fatalf("new session used account waiting for another tool result: %s", accountID)
+	}
+}
+
+func TestAccountSchedulerUsesOneActiveRequestPerAccount(t *testing.T) {
+	dir := t.TempDir()
+	oneDir, twoDir := filepath.Join(dir, "one"), filepath.Join(dir, "two")
+	writeTestCredential(t, oneDir, "one@example.com")
+	writeTestCredential(t, twoDir, "two@example.com")
+	store := &stateStore{path: filepath.Join(dir, "state.json"), state: gatewayState{Accounts: []accountConfig{
+		{ID: "one", ConfigDir: oneDir, Enabled: true}, {ID: "two", ConfigDir: twoDir, Enabled: true},
+	}}}
+	manager := newAccountManager(store, "headless", "", dir, filepath.Join(dir, "accounts"))
+	_, first, err := manager.acquire("session-one", defaultModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, second, err := manager.acquire("session-two", defaultModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatalf("concurrent requests used one account: %s", first)
+	}
+}
+
+func TestAdmissionCooldownIsScopedToAccountExit(t *testing.T) {
+	dir := t.TempDir()
+	accountDir := filepath.Join(dir, "one")
+	writeTestCredential(t, accountDir, "one@example.com")
+	store := &stateStore{path: filepath.Join(dir, "state.json"), state: gatewayState{Accounts: []accountConfig{{ID: "one", ConfigDir: accountDir, Proxy: "old", Enabled: true}}}}
+	manager := newAccountManager(store, "headless", "", dir, filepath.Join(dir, "accounts"))
+	manager.markAdmissionFailure("one")
+	if _, _, err := manager.acquire("session", defaultModel); err == nil {
+		t.Fatal("admission-cooled account+exit was selected")
+	}
+	if !manager.setAccountProxy("one", "new") {
+		t.Fatal("could not switch account exit")
+	}
+	if _, _, err := manager.acquire("session", defaultModel); err != nil {
+		t.Fatalf("new exit remained incorrectly cooled: %v", err)
 	}
 }
 

@@ -14,9 +14,9 @@
 <section class="page active" id="page-accounts">
  <div class="metrics" id="metrics"></div>
  <div class="card"><div class="row"><h2 class="grow">官方 CLI 账号实例</h2><button class="btn blue" onclick="startAccountLogin()">添加账号</button><button class="btn gray" onclick="loadAccounts()">刷新</button></div>
-  <p class="muted">账号认证由官方 CLI 管理；本页不会读取或调用旧网关 Token。</p>
+  <p class="muted">账号认证由官方 CLI 管理；“移除”只从网关调度池移除账号并保留本机凭据目录。</p>
   <div id="login-panel" class="card" style="display:none;margin-top:10px"></div>
-  <div style="overflow:auto"><table><thead><tr><th>账号</th><th>状态</th><th>CLI 状态</th><th>当前出口</th><th>会话/请求</th><th>模型数</th><th>最后错误</th><th>操作</th></tr></thead><tbody id="accounts-body"></tbody></table></div>
+  <div style="overflow:auto"><table><thead><tr><th>账号</th><th>状态</th><th>CLI 状态</th><th>当前出口</th><th>复用会话/请求</th><th>模型数</th><th>最后错误</th><th>操作</th></tr></thead><tbody id="accounts-body"></tbody></table></div>
  </div>
  <div class="card"><div class="row"><h2 class="grow">账号迁移配置</h2><button class="btn gray" onclick="loadAccountConfig(true)">重新读取</button><button class="btn gray" onclick="copyAccountConfig()">复制配置</button><button class="btn blue" onclick="saveAccountConfig()">保存配置</button></div>
   <p class="bad" style="padding:8px;border-radius:6px">敏感信息：下方 JSON 包含所有账号的完整 authToken。只复制到你自己控制的 VPS，不要截图、分享或提交 GitHub。</p>
