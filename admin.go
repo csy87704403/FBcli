@@ -22,6 +22,8 @@ import (
 
 const officialAccessTierURL = "https://freebuff.com/api/web/access-tier"
 
+const ipCapProxyCooldown = 10 * time.Minute
+
 type egressTierStatus struct {
 	Tier      string    `json:"tier"`
 	Detail    string    `json:"detail,omitempty"`
@@ -213,14 +215,15 @@ func (s *stateStore) selectedProxy() string {
 }
 
 type adminService struct {
-	store        *stateStore
-	server       *server
-	auth         *adminAuthenticator
-	mihomoConfig string
-	runtimeMu    sync.RWMutex
-	proxyScanMu  sync.Mutex
-	lastError    string
-	lastAt       time.Time
+	store           *stateStore
+	server          *server
+	auth            *adminAuthenticator
+	mihomoConfig    string
+	runtimeMu       sync.RWMutex
+	proxyScanMu     sync.Mutex
+	proxyFailoverMu sync.Mutex
+	lastError       string
+	lastAt          time.Time
 }
 
 func newAdminService(store *stateStore, server *server, username, password, mihomoConfig string) *adminService {
@@ -985,4 +988,58 @@ func (a *adminService) selectProxy(w http.ResponseWriter, r *http.Request) {
 	a.server.accounts.setProxy(request.Addr)
 	status := a.updateEgressTier(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "selected": request.Addr, "egress_tier": status})
+}
+
+func (a *adminService) rotateProxyAfterIPCap() bool {
+	a.proxyFailoverMu.Lock()
+	defer a.proxyFailoverMu.Unlock()
+	a.proxyScanMu.Lock()
+	defer a.proxyScanMu.Unlock()
+
+	now := time.Now()
+	a.store.mu.Lock()
+	current := a.store.state.SelectedProxy
+	if current == "" {
+		a.store.mu.Unlock()
+		return false
+	}
+	for index := range a.store.state.Proxies {
+		if a.store.state.Proxies[index].Addr == current {
+			a.store.state.Proxies[index].CooldownUntil = now.Add(ipCapProxyCooldown)
+			a.store.state.Proxies[index].Detail = "upstream_ip_capped"
+			break
+		}
+	}
+	best := -1
+	for index := range a.store.state.Proxies {
+		node := &a.store.state.Proxies[index]
+		if node.Addr == current || node.Mode != "full" || !node.Alive || node.CooldownUntil.After(now) {
+			continue
+		}
+		if best < 0 || node.TierLatencyMS < a.store.state.Proxies[best].TierLatencyMS {
+			best = index
+		}
+	}
+	if best < 0 {
+		_ = a.store.saveLocked()
+		a.store.mu.Unlock()
+		return false
+	}
+	next := a.store.state.Proxies[best].Addr
+	a.store.state.SelectedProxy = next
+	a.store.state.EgressTier = egressTierStatus{
+		Tier: a.store.state.Proxies[best].Mode, Detail: a.store.state.Proxies[best].TierDetail,
+		CheckedAt: a.store.state.Proxies[best].TierCheckedAt, LatencyMS: a.store.state.Proxies[best].TierLatencyMS,
+	}
+	err := a.store.saveLocked()
+	a.store.mu.Unlock()
+	if err != nil {
+		log.Printf("persist IP-cap proxy failover: %v", err)
+		return false
+	}
+	if a.server != nil && a.server.accounts != nil {
+		a.server.accounts.setProxy(next)
+	}
+	log.Printf("rotated Freebuff exit after ip_capped: %s -> %s", current, next)
+	return true
 }

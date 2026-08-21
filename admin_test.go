@@ -85,6 +85,32 @@ func TestAutomaticProxySelectionReplacesNonFullNode(t *testing.T) {
 	}
 }
 
+func TestRotateProxyAfterIPCapChoosesFastestOtherFullNode(t *testing.T) {
+	dir := t.TempDir()
+	store := &stateStore{path: filepath.Join(dir, "state.json"), state: gatewayState{
+		SelectedProxy: "current",
+		Proxies: []proxyNode{
+			{Addr: "current", Mode: "full", Alive: true, TierLatencyMS: 10},
+			{Addr: "slow", Mode: "full", Alive: true, TierLatencyMS: 50},
+			{Addr: "fast", Mode: "full", Alive: true, TierLatencyMS: 20},
+			{Addr: "limited", Mode: "limited", Alive: true, TierLatencyMS: 1},
+		},
+	}}
+	if err := store.saveLocked(); err != nil {
+		t.Fatal(err)
+	}
+	admin := &adminService{store: store}
+	if !admin.rotateProxyAfterIPCap() {
+		t.Fatal("IP-cap failover did not select a replacement")
+	}
+	if store.state.SelectedProxy != "fast" {
+		t.Fatalf("selected proxy = %q, want fast", store.state.SelectedProxy)
+	}
+	if !store.state.Proxies[0].CooldownUntil.After(time.Now()) || store.state.Proxies[0].Detail != "upstream_ip_capped" {
+		t.Fatalf("current proxy was not cooled down: %#v", store.state.Proxies[0])
+	}
+}
+
 func TestLoadMihomoListenerNames(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	config := "listeners:\n  - name: freebuff-node-53\n    type: mixed\n    port: 10053\n    proxy: \"🇸🇬VIP新加坡6\"\n  - name: freebuff-node-54\n    port: 10054\n    proxy: '🇺🇸美国2'\n"

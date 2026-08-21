@@ -130,23 +130,24 @@ type pendingToolCall struct {
 }
 
 type cliClient struct {
-	path             string
-	cwd              string
-	configDir        string
-	mu               sync.Mutex
-	processMu        sync.RWMutex
-	cmd              *exec.Cmd
-	stdin            io.WriteCloser
-	scanner          *bufio.Scanner
-	events           chan cliScanResult
-	scanStop         chan struct{}
-	pending          *pendingToolCall
-	toolCalls        int
-	lastToolCall     string
-	repeatedToolCall int
-	proxy            string
-	processPID       int
-	processStartedAt time.Time
+	path                string
+	cwd                 string
+	configDir           string
+	mu                  sync.Mutex
+	processMu           sync.RWMutex
+	cmd                 *exec.Cmd
+	stdin               io.WriteCloser
+	scanner             *bufio.Scanner
+	events              chan cliScanResult
+	scanStop            chan struct{}
+	pending             *pendingToolCall
+	toolCalls           int
+	lastToolCall        string
+	repeatedToolCall    int
+	proxy               string
+	proxyRestartPending bool
+	processPID          int
+	processStartedAt    time.Time
 }
 
 func (c *cliClient) start() error {
@@ -246,6 +247,10 @@ func (c *cliClient) setProxy(proxy string) {
 		return
 	}
 	c.proxy = proxy
+	if c.pending != nil {
+		c.proxyRestartPending = true
+		return
+	}
 	c.resetProcess()
 }
 
@@ -450,6 +455,10 @@ func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, c
 					c.clearPendingTool()
 				} else {
 					c.clearToolState()
+				}
+				if c.proxyRestartPending {
+					c.proxyRestartPending = false
+					c.resetProcess()
 				}
 				if event.Text != "" {
 					return cliChatResult{Text: event.Text}, nil
@@ -917,6 +926,29 @@ func upstreamErrorStatus(message string) (int, string) {
 	}
 }
 
+func isIPCapError(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "ip_capped")
+}
+
+func (s *server) chatWithIPCapFailover(ctx context.Context, model string, selection sessionSelection, prompt string, content []map[string]any, tools []openAITool, toolResult *chatMessage, onDelta func(string), canRetry func() bool) (cliChatResult, error) {
+	client, accountID, err := s.accounts.acquire(selection.ID, model)
+	if err != nil {
+		return cliChatResult{}, err
+	}
+	result, err := client.chat(ctx, model, selection.ID, prompt, content, tools, toolResult, onDelta)
+	s.accounts.finish(accountID, model, selection.ID, err)
+	if !isIPCapError(err) || (canRetry != nil && !canRetry()) || s.admin == nil || !s.admin.rotateProxyAfterIPCap() {
+		return result, err
+	}
+	client, accountID, retryAcquireErr := s.accounts.acquire(selection.ID, model)
+	if retryAcquireErr != nil {
+		return cliChatResult{}, retryAcquireErr
+	}
+	result, err = client.chat(ctx, model, selection.ID, prompt, content, tools, toolResult, onDelta)
+	s.accounts.finish(accountID, model, selection.ID, err)
+	return result, err
+}
+
 func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	startedAt := time.Now()
 	var request chatRequest
@@ -944,11 +976,6 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	id := fmt.Sprintf("chatcmpl-cli-%d", time.Now().UnixNano())
 	created := time.Now().Unix()
 	selection := s.sessions.resolve(request, r.Header.Get("X-Freebuff-Session-ID"))
-	client, accountID, err := s.accounts.acquire(selection.ID, model)
-	if err != nil {
-		writeError(w, http.StatusServiceUnavailable, err.Error(), "account_unavailable")
-		return
-	}
 	inputChars := len(prompt)
 	requestContext, cancel := context.WithTimeout(r.Context(), maxGatewayRequestTime)
 	defer cancel()
@@ -975,8 +1002,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				flusher.Flush()
 			}
 		}
-		result, err := client.chat(requestContext, model, selection.ID, prompt, content, request.Tools, toolResult, onDelta)
-		s.accounts.finish(accountID, model, selection.ID, err)
+		result, err := s.chatWithIPCapFailover(requestContext, model, selection, prompt, content, request.Tools, toolResult, onDelta, func() bool { return toolResult == nil && outputChars == 0 })
 		if err != nil {
 			s.admin.recordUsage(model, apiKeyFromRequest(r), inputChars, outputChars, false, time.Since(startedAt), err)
 			_, errorType := upstreamErrorStatus(err.Error())
@@ -1008,9 +1034,12 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := client.chat(requestContext, model, selection.ID, prompt, content, request.Tools, toolResult, nil)
-	s.accounts.finish(accountID, model, selection.ID, err)
+	result, err := s.chatWithIPCapFailover(requestContext, model, selection, prompt, content, request.Tools, toolResult, nil, func() bool { return toolResult == nil })
 	if err != nil {
+		if strings.Contains(err.Error(), "no authenticated account") || strings.Contains(err.Error(), "conversation account") || strings.Contains(err.Error(), "cooling down") {
+			writeError(w, http.StatusServiceUnavailable, err.Error(), "account_unavailable")
+			return
+		}
 		s.admin.recordUsage(model, apiKeyFromRequest(r), inputChars, 0, false, time.Since(startedAt), err)
 		status, errorType := upstreamErrorStatus(err.Error())
 		writeError(w, status, err.Error(), errorType)
