@@ -156,6 +156,25 @@ func TestConversationRouterCapsPendingToolBindings(t *testing.T) {
 	}
 }
 
+func TestUpstreamErrorStatus(t *testing.T) {
+	tests := []struct {
+		message string
+		status  int
+		typeID  string
+	}{
+		{"free session rate_limited", 429, "upstream_rate_limited"},
+		{"upstream quota exhausted", 429, "upstream_rate_limited"},
+		{"service_overloaded", 503, "upstream_unavailable"},
+		{"context deadline exceeded", 504, "upstream_timeout"},
+	}
+	for _, test := range tests {
+		status, typeID := upstreamErrorStatus(test.message)
+		if status != test.status || typeID != test.typeID {
+			t.Fatalf("%q = (%d, %q), want (%d, %q)", test.message, status, typeID, test.status, test.typeID)
+		}
+	}
+}
+
 func TestMultimodalContentConvertsDataURL(t *testing.T) {
 	messages := []chatMessage{{Role: "user", Content: []any{
 		map[string]any{"type": "text", "text": "inspect"},

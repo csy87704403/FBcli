@@ -463,6 +463,7 @@ func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, c
 				return cliChatResult{ToolCalls: []openAIToolCall{call}}, nil
 			case "error":
 				c.clearToolState()
+				c.resetProcess()
 				return cliChatResult{}, errors.New(event.Message)
 			}
 		}
@@ -900,6 +901,22 @@ func writeError(w http.ResponseWriter, status int, message, code string) {
 	writeJSON(w, status, map[string]any{"error": map[string]any{"message": message, "type": code}})
 }
 
+func upstreamErrorStatus(message string) (int, string) {
+	lower := strings.ToLower(message)
+	switch {
+	case strings.Contains(lower, "rate_limit"), strings.Contains(lower, "rate limit"),
+		strings.Contains(lower, "quota"), strings.Contains(lower, "budget"), strings.Contains(lower, "429"):
+		return http.StatusTooManyRequests, "upstream_rate_limited"
+	case strings.Contains(lower, "timeout"), strings.Contains(lower, "deadline exceeded"):
+		return http.StatusGatewayTimeout, "upstream_timeout"
+	case strings.Contains(lower, "service_overloaded"), strings.Contains(lower, "ip_capped"),
+		strings.Contains(lower, "temporarily unavailable"):
+		return http.StatusServiceUnavailable, "upstream_unavailable"
+	default:
+		return http.StatusBadGateway, "upstream_error"
+	}
+}
+
 func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	startedAt := time.Now()
 	var request chatRequest
@@ -959,10 +976,11 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		result, err := client.chat(requestContext, model, selection.ID, prompt, content, request.Tools, toolResult, onDelta)
-		s.accounts.finish(accountID, model, err)
+		s.accounts.finish(accountID, model, selection.ID, err)
 		if err != nil {
 			s.admin.recordUsage(model, apiKeyFromRequest(r), inputChars, outputChars, false, time.Since(startedAt), err)
-			data, _ := json.Marshal(map[string]any{"error": map[string]any{"message": err.Error(), "type": "cli_request_failed"}})
+			_, errorType := upstreamErrorStatus(err.Error())
+			data, _ := json.Marshal(map[string]any{"error": map[string]any{"message": err.Error(), "type": errorType}})
 			fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", data)
 			return
 		}
@@ -991,10 +1009,11 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result, err := client.chat(requestContext, model, selection.ID, prompt, content, request.Tools, toolResult, nil)
-	s.accounts.finish(accountID, model, err)
+	s.accounts.finish(accountID, model, selection.ID, err)
 	if err != nil {
 		s.admin.recordUsage(model, apiKeyFromRequest(r), inputChars, 0, false, time.Since(startedAt), err)
-		writeError(w, http.StatusBadGateway, err.Error(), "cli_request_failed")
+		status, errorType := upstreamErrorStatus(err.Error())
+		writeError(w, status, err.Error(), errorType)
 		return
 	}
 	if toolResult != nil {

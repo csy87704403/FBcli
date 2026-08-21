@@ -303,11 +303,11 @@ func (m *accountManager) persistAccountSession(sessionID string, binding account
 	return nil
 }
 
-func (m *accountManager) finish(accountID, model string, requestErr error) {
+func (m *accountManager) finish(accountID, model, sessionID string, requestErr error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	runtime := m.runtimes[accountID]
 	if runtime == nil {
+		m.mu.Unlock()
 		return
 	}
 	if runtime.active > 0 {
@@ -317,8 +317,10 @@ func (m *accountManager) finish(accountID, model string, requestErr error) {
 	if requestErr == nil {
 		runtime.activeModel = model
 		runtime.lastError = ""
+		m.mu.Unlock()
 		return
 	}
+	delete(m.sessionAccounts, accountSessionKey(sessionID))
 	runtime.lastError = requestErr.Error()
 	lower := strings.ToLower(runtime.lastError)
 	if strings.Contains(lower, "rate_limit") || strings.Contains(lower, "rate limit") ||
@@ -326,6 +328,14 @@ func (m *accountManager) finish(accountID, model string, requestErr error) {
 		runtime.cooldownUntil = time.Now().Add(15 * time.Minute)
 	} else if strings.Contains(lower, "not authenticated") || strings.Contains(lower, "unauthorized") || strings.Contains(lower, "401") {
 		runtime.cooldownUntil = time.Now().Add(30 * time.Minute)
+	}
+	m.mu.Unlock()
+	m.store.mu.Lock()
+	delete(m.store.state.AccountSessions, accountSessionKey(sessionID))
+	err := m.store.saveLocked()
+	m.store.mu.Unlock()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "remove failed account session binding: %v\n", err)
 	}
 }
 

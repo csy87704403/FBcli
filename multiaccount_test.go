@@ -94,14 +94,14 @@ func TestAccountSchedulerBalancesAndPinsSessions(t *testing.T) {
 	if firstAccount == secondAccount {
 		t.Fatalf("two concurrent sessions selected the same account: %s", firstAccount)
 	}
-	manager.finish(firstAccount, defaultModel, nil)
-	manager.finish(secondAccount, defaultModel, nil)
+	manager.finish(firstAccount, defaultModel, "session-one", nil)
+	manager.finish(secondAccount, defaultModel, "session-two", nil)
 
 	_, resumedAccount, err := manager.acquire("session-one", defaultModel)
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager.finish(resumedAccount, defaultModel, nil)
+	manager.finish(resumedAccount, defaultModel, "session-one", nil)
 	if resumedAccount != firstAccount {
 		t.Fatalf("session moved accounts: got %s, want %s", resumedAccount, firstAccount)
 	}
@@ -122,12 +122,12 @@ func TestAccountSchedulerPrefersEmptyAccountForDifferentModel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager.finish(deepSeekAccount, defaultModel, nil)
+	manager.finish(deepSeekAccount, defaultModel, "deepseek-session", nil)
 	_, mimoAccount, err := manager.acquire("mimo-session", mimoModel)
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager.finish(mimoAccount, mimoModel, nil)
+	manager.finish(mimoAccount, mimoModel, "mimo-session", nil)
 	if mimoAccount == deepSeekAccount {
 		t.Fatalf("MiMo reused the DeepSeek-locked account while an empty account was available: %s", mimoAccount)
 	}
@@ -149,7 +149,7 @@ func TestAccountSchedulerSkipsAccountWaitingForAnotherToolResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager.finish(accountID, defaultModel, nil)
+	manager.finish(accountID, defaultModel, "new-session", nil)
 	if accountID != "two" {
 		t.Fatalf("new session used account waiting for another tool result: %s", accountID)
 	}
@@ -193,7 +193,7 @@ func TestLimitedAccountEntersCooldown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager.finish(accountID, defaultModel, os.ErrDeadlineExceeded)
+	manager.finish(accountID, defaultModel, "session", os.ErrDeadlineExceeded)
 	if !manager.runtimes[accountID].cooldownUntil.IsZero() {
 		t.Fatal("transport error incorrectly cooled down the account")
 	}
@@ -201,9 +201,28 @@ func TestLimitedAccountEntersCooldown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager.finish(accountID, defaultModel, &testError{"free session rate_limited"})
+	manager.finish(accountID, defaultModel, "limited-session", &testError{"free session rate_limited"})
 	if !manager.runtimes[accountID].cooldownUntil.After(time.Now()) {
 		t.Fatal("rate-limited account did not enter cooldown")
+	}
+}
+
+func TestFailedRequestReleasesAccountSessionBinding(t *testing.T) {
+	dir := t.TempDir()
+	accountDir := filepath.Join(dir, "one")
+	writeTestCredential(t, accountDir, "one@example.com")
+	store := &stateStore{path: filepath.Join(dir, "state.json"), state: gatewayState{Accounts: []accountConfig{{ID: "one", ConfigDir: accountDir, Enabled: true}}, AccountSessions: make(map[string]accountSessionBinding)}}
+	manager := newAccountManager(store, "headless", "", dir, filepath.Join(dir, "accounts"))
+	_, accountID, err := manager.acquire("failed-session", defaultModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.finish(accountID, defaultModel, "failed-session", &testError{"upstream quota exhausted"})
+	if _, found := manager.sessionAccounts[accountSessionKey("failed-session")]; found {
+		t.Fatal("failed request kept its account session binding")
+	}
+	if !manager.runtimes[accountID].cooldownUntil.After(time.Now()) {
+		t.Fatal("quota failure did not cool down the account")
 	}
 }
 
@@ -249,7 +268,7 @@ func TestAccountSessionBindingSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstManager.finish(expectedAccount, defaultModel, nil)
+	firstManager.finish(expectedAccount, defaultModel, "private-session-id", nil)
 
 	reloadedStore, err := newStateStore(statePath, "", "")
 	if err != nil {
@@ -260,7 +279,7 @@ func TestAccountSessionBindingSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondManager.finish(actualAccount, defaultModel, nil)
+	secondManager.finish(actualAccount, defaultModel, "private-session-id", nil)
 	if actualAccount != expectedAccount {
 		t.Fatalf("session account after restart = %s, want %s", actualAccount, expectedAccount)
 	}
