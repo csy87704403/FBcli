@@ -34,6 +34,8 @@ const (
 	staleToolResultTimeout = 3 * time.Minute
 	maxExternalToolCalls   = 48
 	maxRepeatedToolCalls   = 5
+	maxGatewayRequestTime  = 12 * time.Minute
+	headlessStartTimeout   = 30 * time.Second
 )
 
 var gatewayModels = []string{defaultModel, mimoModel}
@@ -92,6 +94,11 @@ type cliEvent struct {
 	Arguments  json.RawMessage `json:"arguments"`
 }
 
+type cliScanResult struct {
+	line []byte
+	err  error
+}
+
 type cliChatResult struct {
 	Text      string
 	ToolCalls []openAIToolCall
@@ -130,6 +137,8 @@ type cliClient struct {
 	cmd              *exec.Cmd
 	stdin            io.WriteCloser
 	scanner          *bufio.Scanner
+	events           chan cliScanResult
+	scanStop         chan struct{}
 	pending          *pendingToolCall
 	toolCalls        int
 	lastToolCall     string
@@ -160,16 +169,50 @@ func (c *cliClient) start() error {
 	}
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64<<10), 4<<20)
-	if !scanner.Scan() {
+	readyResult := make(chan error, 1)
+	go func() {
+		if !scanner.Scan() {
+			readyResult <- errors.New("headless CLI exited before ready")
+			return
+		}
+		var ready cliEvent
+		if err := json.Unmarshal(scanner.Bytes(), &ready); err != nil || ready.Type != "ready" {
+			readyResult <- fmt.Errorf("invalid headless CLI ready event: %s", scanner.Text())
+			return
+		}
+		readyResult <- nil
+	}()
+	select {
+	case err := <-readyResult:
+		if err != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			return err
+		}
+	case <-time.After(headlessStartTimeout):
 		_ = cmd.Process.Kill()
-		return errors.New("headless CLI exited before ready")
-	}
-	var ready cliEvent
-	if err := json.Unmarshal(scanner.Bytes(), &ready); err != nil || ready.Type != "ready" {
-		_ = cmd.Process.Kill()
-		return fmt.Errorf("invalid headless CLI ready event: %s", scanner.Text())
+		_ = cmd.Wait()
+		return errors.New("headless CLI did not become ready before timeout")
 	}
 	c.cmd, c.stdin, c.scanner = cmd, stdin, scanner
+	c.events = make(chan cliScanResult, 256)
+	c.scanStop = make(chan struct{})
+	events, stop := c.events, c.scanStop
+	go func() {
+		defer close(events)
+		for scanner.Scan() {
+			line := append([]byte(nil), scanner.Bytes()...)
+			select {
+			case events <- cliScanResult{line: line}:
+			case <-stop:
+				return
+			}
+		}
+		select {
+		case events <- cliScanResult{err: scanner.Err()}:
+		case <-stop:
+		}
+	}()
 	c.processMu.Lock()
 	c.processPID = cmd.Process.Pid
 	c.processStartedAt = time.Now()
@@ -237,6 +280,10 @@ func (c *cliClient) clearPendingTool() {
 }
 
 func (c *cliClient) resetProcess() {
+	if c.scanStop != nil {
+		close(c.scanStop)
+		c.scanStop = nil
+	}
 	if c.stdin != nil {
 		_ = c.stdin.Close()
 	}
@@ -244,7 +291,7 @@ func (c *cliClient) resetProcess() {
 		_ = c.cmd.Process.Kill()
 		_, _, _ = c.cmd.ProcessState, c.cmd.Process, c.cmd.Wait()
 	}
-	c.cmd, c.stdin, c.scanner = nil, nil, nil
+	c.cmd, c.stdin, c.scanner, c.events = nil, nil, nil, nil
 	c.clearToolState()
 	c.processMu.Lock()
 	c.processPID = 0
@@ -370,53 +417,55 @@ func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, c
 	}
 
 	var streamed strings.Builder
-	for c.scanner.Scan() {
-		if err := ctx.Err(); err != nil {
+	for {
+		select {
+		case <-ctx.Done():
 			c.resetProcess()
-			c.pending = nil
-			return cliChatResult{}, err
-		}
-		var event cliEvent
-		if err := json.Unmarshal(c.scanner.Bytes(), &event); err != nil {
-			continue
-		}
-		if event.ID != id {
-			continue
-		}
-		switch event.Type {
-		case "delta":
-			streamed.WriteString(event.Text)
-			if onDelta != nil {
-				onDelta(event.Text)
+			return cliChatResult{}, ctx.Err()
+		case scanned, ok := <-c.events:
+			if !ok {
+				c.resetProcess()
+				return cliChatResult{}, errors.New("headless CLI closed its output")
 			}
-		case "result":
-			if toolResult != nil {
-				c.clearPendingTool()
-			} else {
+			if scanned.err != nil {
+				c.resetProcess()
+				return cliChatResult{}, scanned.err
+			}
+			var event cliEvent
+			if err := json.Unmarshal(scanned.line, &event); err != nil {
+				continue
+			}
+			if event.ID != id {
+				continue
+			}
+			switch event.Type {
+			case "delta":
+				streamed.WriteString(event.Text)
+				if onDelta != nil {
+					onDelta(event.Text)
+				}
+			case "result":
+				if toolResult != nil {
+					c.clearPendingTool()
+				} else {
+					c.clearToolState()
+				}
+				if event.Text != "" {
+					return cliChatResult{Text: event.Text}, nil
+				}
+				return cliChatResult{Text: streamed.String()}, nil
+			case "tool_call":
+				call := newToolCall(event)
+				if err := c.setPendingToolCall(id, sessionID, call); err != nil {
+					return cliChatResult{}, err
+				}
+				return cliChatResult{ToolCalls: []openAIToolCall{call}}, nil
+			case "error":
 				c.clearToolState()
+				return cliChatResult{}, errors.New(event.Message)
 			}
-			if event.Text != "" {
-				return cliChatResult{Text: event.Text}, nil
-			}
-			return cliChatResult{Text: streamed.String()}, nil
-		case "tool_call":
-			call := newToolCall(event)
-			if err := c.setPendingToolCall(id, sessionID, call); err != nil {
-				return cliChatResult{}, err
-			}
-			return cliChatResult{ToolCalls: []openAIToolCall{call}}, nil
-		case "error":
-			c.clearToolState()
-			return cliChatResult{}, errors.New(event.Message)
 		}
 	}
-	err := c.scanner.Err()
-	c.resetProcess()
-	c.pending = nil
-	if err != nil {
-		return cliChatResult{}, err
-	}
-	return cliChatResult{}, errors.New("headless CLI closed its output")
 }
 
 func contentValue(content any) any {
@@ -832,6 +881,8 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	inputChars := len(prompt)
+	requestContext, cancel := context.WithTimeout(r.Context(), maxGatewayRequestTime)
+	defer cancel()
 
 	if request.Stream {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -855,7 +906,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				flusher.Flush()
 			}
 		}
-		result, err := client.chat(r.Context(), model, selection.ID, prompt, content, request.Tools, toolResult, onDelta)
+		result, err := client.chat(requestContext, model, selection.ID, prompt, content, request.Tools, toolResult, onDelta)
 		s.accounts.finish(accountID, model, err)
 		if err != nil {
 			s.admin.recordUsage(model, apiKeyFromRequest(r), inputChars, outputChars, false, time.Since(startedAt), err)
@@ -884,7 +935,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := client.chat(r.Context(), model, selection.ID, prompt, content, request.Tools, toolResult, nil)
+	result, err := client.chat(requestContext, model, selection.ID, prompt, content, request.Tools, toolResult, nil)
 	s.accounts.finish(accountID, model, err)
 	if err != nil {
 		s.admin.recordUsage(model, apiKeyFromRequest(r), inputChars, 0, false, time.Since(startedAt), err)
