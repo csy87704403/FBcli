@@ -328,6 +328,23 @@ func (m *accountManager) acquire(sessionID, requestedModel string) (*cliClient, 
 	return selected.client, selected.config.ID, nil
 }
 
+func (m *accountManager) sessionIdle(sessionID, requestedModel string) bool {
+	key := accountSessionKey(sessionID)
+	cliSessionID := scopedSessionID(requestedModel, sessionID)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	binding, found := m.sessionAccounts[key]
+	if !found || binding.Updated.Before(time.Now().Add(-sessionBindingTTL)) {
+		return false
+	}
+	runtime := m.runtimes[binding.AccountID]
+	if runtime == nil || runtime.active > 0 || runtime.reconfiguring || !runtime.config.Enabled {
+		return false
+	}
+	pending := runtime.client.pendingSession()
+	return pending == "" || pending == cliSessionID
+}
+
 func accountSessionKey(sessionID string) string {
 	sum := sha256.Sum256([]byte(sessionID))
 	return hex.EncodeToString(sum[:16])

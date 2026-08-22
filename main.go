@@ -105,8 +105,9 @@ type cliChatResult struct {
 }
 
 type sessionSelection struct {
-	ID        string
-	Automatic bool
+	ID          string
+	Automatic   bool
+	FallbackKey string
 }
 
 type sessionBinding struct {
@@ -118,6 +119,7 @@ type conversationRouter struct {
 	mu         sync.Mutex
 	byHistory  map[string]sessionBinding
 	byToolCall map[string]sessionBinding
+	byFallback map[string]sessionBinding
 	store      *stateStore
 }
 
@@ -723,15 +725,17 @@ func historyKeyForResult(request chatRequest, result cliChatResult) (string, boo
 const (
 	// A remote agent may keep an active conversation for a while, but retaining
 	// bindings for a whole day creates stale CLI context and artificial load.
-	sessionBindingTTL   = 30 * time.Minute
-	maxToolCallBindings = 512
-	maxHistoryBindings  = 512
+	sessionBindingTTL       = 30 * time.Minute
+	shortSessionFallbackTTL = 2 * time.Minute
+	maxToolCallBindings     = 512
+	maxHistoryBindings      = 512
 )
 
 func newConversationRouter(stores ...*stateStore) *conversationRouter {
 	router := &conversationRouter{
 		byHistory:  make(map[string]sessionBinding),
 		byToolCall: make(map[string]sessionBinding),
+		byFallback: make(map[string]sessionBinding),
 	}
 	if len(stores) == 0 || stores[0] == nil {
 		return router
@@ -769,6 +773,18 @@ func (router *conversationRouter) persist(key string, binding sessionBinding, sa
 
 }
 
+func shortFallbackKey(request chatRequest, model string) string {
+	user := strings.TrimSpace(request.User)
+	if user == "" {
+		return ""
+	}
+	if model = strings.TrimSpace(model); model == "" {
+		model = defaultModel
+	}
+	sum := sha256.Sum256([]byte("short-fallback\x00" + model + "\x00" + user))
+	return hex.EncodeToString(sum[:16])
+}
+
 func (router *conversationRouter) reapExpired() {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
@@ -785,6 +801,11 @@ func (router *conversationRouter) reapExpired() {
 		for toolCallID, binding := range router.byToolCall {
 			if binding.Updated.Before(cutoff) {
 				delete(router.byToolCall, toolCallID)
+			}
+		}
+		for key, binding := range router.byFallback {
+			if binding.Updated.Before(time.Now().Add(-shortSessionFallbackTTL)) {
+				delete(router.byFallback, key)
 			}
 		}
 		router.mu.Unlock()
@@ -806,6 +827,10 @@ func (router *conversationRouter) reapExpired() {
 }
 
 func (router *conversationRouter) resolve(request chatRequest, header string, models ...string) sessionSelection {
+	model := defaultModel
+	if len(models) > 0 && strings.TrimSpace(models[0]) != "" {
+		model = models[0]
+	}
 	if explicit := explicitSessionID(request, header); explicit != "" {
 		return sessionSelection{ID: explicit}
 	}
@@ -821,7 +846,16 @@ func (router *conversationRouter) resolve(request chatRequest, header string, mo
 	}
 	key, found := historyKey(request)
 	if !found {
-		return sessionSelection{ID: newAutoSessionID(), Automatic: true}
+		fallbackKey := shortFallbackKey(request, model)
+		if fallbackKey != "" {
+			router.mu.Lock()
+			if binding, ok := router.byFallback[fallbackKey]; ok && binding.ID != "" && binding.Updated.After(time.Now().Add(-shortSessionFallbackTTL)) {
+				router.mu.Unlock()
+				return sessionSelection{ID: binding.ID, Automatic: true, FallbackKey: fallbackKey}
+			}
+			router.mu.Unlock()
+		}
+		return sessionSelection{ID: newAutoSessionID(), Automatic: true, FallbackKey: fallbackKey}
 	}
 	router.mu.Lock()
 	defer router.mu.Unlock()
@@ -829,9 +863,18 @@ func (router *conversationRouter) resolve(request chatRequest, header string, mo
 		binding.Updated = time.Now()
 		router.byHistory[key] = binding
 		router.persist(key, binding, true)
-		return sessionSelection{ID: binding.ID, Automatic: true}
+		return sessionSelection{ID: binding.ID, Automatic: true, FallbackKey: shortFallbackKey(request, model)}
 	}
-	return sessionSelection{ID: newAutoSessionID(), Automatic: true}
+	return sessionSelection{ID: newAutoSessionID(), Automatic: true, FallbackKey: shortFallbackKey(request, model)}
+}
+
+func (router *conversationRouter) discardFallback(key string) {
+	if key == "" {
+		return
+	}
+	router.mu.Lock()
+	delete(router.byFallback, key)
+	router.mu.Unlock()
 }
 
 func (router *conversationRouter) completeToolResult(toolCallID string) {
@@ -863,6 +906,11 @@ func (router *conversationRouter) forget(sessionID string) {
 			delete(router.byToolCall, toolCallID)
 		}
 	}
+	for key, binding := range router.byFallback {
+		if binding.ID == sessionID {
+			delete(router.byFallback, key)
+		}
+	}
 	router.mu.Unlock()
 	if router.store == nil || len(removedHistory) == 0 {
 		return
@@ -886,7 +934,7 @@ func (router *conversationRouter) bind(request chatRequest, result cliChatResult
 	if !found {
 		key, found = historyKeyForResult(request, result)
 	}
-	if !found && len(result.ToolCalls) == 0 {
+	if !found && len(result.ToolCalls) == 0 && selection.FallbackKey == "" {
 		return
 	}
 	router.mu.Lock()
@@ -902,6 +950,9 @@ func (router *conversationRouter) bind(request chatRequest, result cliChatResult
 		}
 	}
 	binding := sessionBinding{ID: selection.ID, Updated: time.Now()}
+	if selection.FallbackKey != "" {
+		router.byFallback[selection.FallbackKey] = binding
+	}
 	if found {
 		router.byHistory[key] = binding
 	}
@@ -1066,6 +1117,10 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	id := fmt.Sprintf("chatcmpl-cli-%d", time.Now().UnixNano())
 	created := time.Now().Unix()
 	selection := s.sessions.resolve(request, r.Header.Get("X-Freebuff-Session-ID"), model)
+	if selection.FallbackKey != "" && !s.accounts.sessionIdle(selection.ID, model) {
+		s.sessions.discardFallback(selection.FallbackKey)
+		selection = sessionSelection{ID: newAutoSessionID(), Automatic: true, FallbackKey: shortFallbackKey(request, model)}
+	}
 	inputChars := len(prompt)
 	requestContext, cancel := context.WithTimeout(r.Context(), maxGatewayRequestTime)
 	defer cancel()

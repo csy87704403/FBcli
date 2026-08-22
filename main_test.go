@@ -125,6 +125,32 @@ func TestConversationRouterExplicitIDWins(t *testing.T) {
 	}
 }
 
+func TestConversationRouterReusesRecentHermesFallback(t *testing.T) {
+	router := newConversationRouter()
+	first := chatRequest{Model: defaultModel, User: "hermes-user-1", Messages: []chatMessage{{Role: "user", Content: "first task"}}}
+	selection := router.resolve(first, "", defaultModel)
+	if selection.FallbackKey == "" {
+		t.Fatal("Hermes fallback key was not created")
+	}
+	router.bind(first, cliChatResult{Text: "done"}, selection)
+	next := chatRequest{Model: defaultModel, User: "hermes-user-1", Messages: []chatMessage{{Role: "user", Content: "follow up without history"}}}
+	resumed := router.resolve(next, "", defaultModel)
+	if resumed.ID != selection.ID || resumed.FallbackKey == "" {
+		t.Fatalf("short Hermes fallback did not resume: %#v", resumed)
+	}
+}
+
+func TestConversationRouterHermesFallbackIsModelScoped(t *testing.T) {
+	router := newConversationRouter()
+	first := chatRequest{Model: defaultModel, User: "hermes-user-1", Messages: []chatMessage{{Role: "user", Content: "first task"}}}
+	selection := router.resolve(first, "", defaultModel)
+	router.bind(first, cliChatResult{Text: "done"}, selection)
+	other := router.resolve(chatRequest{Model: mimoModel, User: "hermes-user-1", Messages: []chatMessage{{Role: "user", Content: "mimo task"}}}, "", mimoModel)
+	if other.ID == selection.ID {
+		t.Fatal("fallback crossed model boundary")
+	}
+}
+
 func TestScopedSessionIDSeparatesModelsButKeepsSameModel(t *testing.T) {
 	if scopedSessionID(defaultModel, "agent") == scopedSessionID(mimoModel, "agent") {
 		t.Fatal("different models shared the same CLI session id")

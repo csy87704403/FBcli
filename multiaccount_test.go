@@ -218,6 +218,25 @@ func TestAccountSchedulerUsesOneActiveRequestPerAccount(t *testing.T) {
 	}
 }
 
+func TestAccountSessionIdleRejectsActiveSession(t *testing.T) {
+	dir := t.TempDir()
+	accountDir := filepath.Join(dir, "one")
+	writeTestCredential(t, accountDir, "one@example.com")
+	store := &stateStore{path: filepath.Join(dir, "state.json"), state: gatewayState{Accounts: []accountConfig{{ID: "one", ConfigDir: accountDir, Enabled: true}}}}
+	manager := newAccountManager(store, "headless", "", dir, filepath.Join(dir, "accounts"))
+	_, accountID, err := manager.acquire("hermes-short", defaultModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manager.sessionIdle("hermes-short", defaultModel) {
+		t.Fatal("active account session was considered idle")
+	}
+	manager.finish(accountID, defaultModel, "hermes-short", nil)
+	if !manager.sessionIdle("hermes-short", defaultModel) {
+		t.Fatal("completed account session was not considered idle")
+	}
+}
+
 func TestAdmissionCooldownIsScopedToAccountExit(t *testing.T) {
 	dir := t.TempDir()
 	accountDir := filepath.Join(dir, "one")
