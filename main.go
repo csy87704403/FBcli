@@ -25,8 +25,11 @@ import (
 )
 
 const (
-	defaultModel = "deepseek/deepseek-v4-flash"
-	mimoModel    = "mimo/mimo-v2.5"
+	defaultModel     = "deepseek/deepseek-v4-flash"
+	deepSeekProModel = "deepseek/deepseek-v4-pro"
+	gptLunaModel     = "openai/gpt-5.6-luna"
+	miniMaxModel     = "minimax/minimax-m3"
+	mimoModel        = "mimo/mimo-v2.5"
 
 	// An external tool result normally arrives immediately after a tool call. These
 	// limits turn a broken Agent tool loop into a recoverable request failure rather
@@ -38,12 +41,27 @@ const (
 	headlessStartTimeout   = 30 * time.Second
 )
 
-var gatewayModels = []string{defaultModel, mimoModel}
+// gatewayModels mirrors the public Freebuff CLI picker. It is a catalog, not a
+// promise that every model is currently joinable: Freebuff may temporarily
+// close a model, exhaust an account's entitlement, or restrict an account to
+// the limited tier. Keep the catalog stable so a temporary model_unavailable
+// response (notably V4 Flash) never makes clients forget that model exists.
+// The official session admission remains the authority for each actual chat.
+var gatewayModels = []string{
+	deepSeekProModel,
+	defaultModel,
+	gptLunaModel,
+	miniMaxModel,
+	mimoModel,
+}
 
 func gatewayModelList() []map[string]any {
 	models := make([]map[string]any, 0, len(gatewayModels))
 	for _, model := range gatewayModels {
-		models = append(models, map[string]any{"id": model, "object": "model", "owned_by": "freebuff-cli"})
+		models = append(models, map[string]any{
+			"id": model, "object": "model", "owned_by": "freebuff-cli",
+			"x_freebuff_admission": "official",
+		})
 	}
 	return models
 }

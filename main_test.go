@@ -6,10 +6,16 @@ import (
 	"testing"
 )
 
-func TestGatewayModelListIncludesDeepSeekAndMiMo(t *testing.T) {
+func TestGatewayModelListMatchesOfficialFreebuffPicker(t *testing.T) {
 	models := gatewayModelList()
-	if len(models) != 2 || models[0]["id"] != defaultModel || models[1]["id"] != mimoModel {
-		t.Fatalf("unexpected model catalog: %#v", models)
+	want := []string{deepSeekProModel, defaultModel, gptLunaModel, miniMaxModel, mimoModel}
+	if len(models) != len(want) {
+		t.Fatalf("model count = %d, want %d: %#v", len(models), len(want), models)
+	}
+	for index, model := range models {
+		if model["id"] != want[index] || model["x_freebuff_admission"] != "official" {
+			t.Fatalf("model %d = %#v, want %q", index, model, want[index])
+		}
 	}
 }
 
