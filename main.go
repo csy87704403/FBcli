@@ -1055,6 +1055,23 @@ func isIPCapError(err error) bool {
 	return err != nil && strings.Contains(strings.ToLower(err.Error()), "ip_capped")
 }
 
+// Account quota failures are safe to retry on another authenticated account
+// only for a fresh user turn. Tool-result callbacks must never be replayed:
+// doing so could execute an external tool twice. finish() already removes the
+// failed binding and places the account in cooldown before acquire() selects
+// the next account.
+func isAccountQuotaError(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "rate_limited") ||
+		strings.Contains(lower, "rate limit") ||
+		strings.Contains(lower, "spend_limited") ||
+		strings.Contains(lower, "quota") ||
+		strings.Contains(lower, "budget")
+}
+
 func isRecoverableCLIError(err error) bool {
 	if err == nil {
 		return false
@@ -1088,6 +1105,13 @@ func (s *server) chatWithIPCapFailover(ctx context.Context, model string, select
 		if s.admin == nil || !s.admin.rotateProxyAfterIPCap(accountID) {
 			return result, err
 		}
+	} else if isAccountQuotaError(err) {
+		// The failed account is cooled by finish(). A fresh turn can safely
+		// continue on another account; a tool result cannot be replayed.
+		if toolResult != nil {
+			return result, err
+		}
+		s.accounts.coolAccount(accountID)
 	} else if isRecoverableCLIError(err) {
 		// chat() already terminated its broken process in the output/start paths.
 		// A waiting external-tool state needs an explicit reset before retrying a

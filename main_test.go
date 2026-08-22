@@ -13,6 +13,22 @@ func TestGatewayVersionIsReleaseTag(t *testing.T) {
 	}
 }
 
+func TestAccountQuotaErrorClassification(t *testing.T) {
+	for _, message := range []string{
+		"free session rate_limited",
+		"Freebuff session admission returned spend_limited",
+		"upstream quota exhausted",
+		"model budget exhausted",
+	} {
+		if !isAccountQuotaError(fmt.Errorf("%s", message)) {
+			t.Fatalf("expected quota error: %q", message)
+		}
+	}
+	if isAccountQuotaError(fmt.Errorf("free session admission returned banned")) {
+		t.Fatal("banned is not a quota error")
+	}
+}
+
 func TestGatewayModelListMatchesOfficialFreebuffPicker(t *testing.T) {
 	models := gatewayModelList()
 	want := []string{deepSeekProModel, defaultModel, gptLunaModel, miniMaxModel, mimoModel}
