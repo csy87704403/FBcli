@@ -2,9 +2,16 @@ package main
 
 import (
 	"fmt"
+	"regexp"
 	"sync"
 	"testing"
 )
+
+func TestGatewayVersionIsReleaseTag(t *testing.T) {
+	if !regexp.MustCompile(`^v[1-9][0-9]*$`).MatchString(gatewayVersion) {
+		t.Fatalf("gateway version %q must be a release tag", gatewayVersion)
+	}
+}
 
 func TestGatewayModelListMatchesOfficialFreebuffPicker(t *testing.T) {
 	models := gatewayModelList()

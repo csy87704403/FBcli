@@ -1285,7 +1285,7 @@ func main() {
 	service.admin.startEgressTierMonitor(monitorContext)
 	apiMux := http.NewServeMux()
 	apiMux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "backend": "freebuff-cli-jsonl"})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "backend": "freebuff-cli-jsonl", "version": gatewayVersion})
 	})
 	apiMux.HandleFunc("GET /v1/models", service.admin.requireAPIKey(func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": gatewayModelList()})
