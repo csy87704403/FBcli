@@ -273,13 +273,13 @@ func TestToolLoopIsResetInsteadOfPersisting(t *testing.T) {
 	}
 }
 
-func TestExpiredToolCallIsReset(t *testing.T) {
+func TestExpiredToolCallIsMarkedExpired(t *testing.T) {
 	client := &cliClient{pending: &pendingToolCall{SessionID: "session", CreatedAt: time.Now().Add(-staleToolResultTimeout)}}
 	if !client.recoverExpiredToolCall(time.Now()) {
-		t.Fatal("expired tool call was not reset")
+		t.Fatal("expired tool call was not marked expired")
 	}
-	if client.pending != nil {
-		t.Fatal("expired tool call remained pending")
+	if client.pending == nil || client.pending.ExpiredAt.IsZero() {
+		t.Fatal("expired tool call was not marked expired")
 	}
 }
 

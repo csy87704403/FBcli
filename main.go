@@ -31,10 +31,9 @@ const (
 	miniMaxModel     = "minimax/minimax-m3"
 	mimoModel        = "mimo/mimo-v2.5"
 
-	// An external tool result normally arrives immediately after a tool call. These
-	// limits turn a broken Agent tool loop into a recoverable request failure rather
-	// than leaving its account process permanently occupied.
-	staleToolResultTimeout = 2 * time.Minute
+	// The CLI may wait while an external agent executes a tool. Keep the default
+	// generous, while allowing deployments to tune it without rebuilding.
+	staleToolResultTimeout = 5 * time.Minute
 	maxExternalToolCalls   = 48
 	maxRepeatedToolCalls   = 5
 	maxGatewayRequestTime  = 12 * time.Minute
@@ -147,6 +146,7 @@ type pendingToolCall struct {
 	ToolCallID string
 	ToolName   string
 	CreatedAt  time.Time
+	ExpiredAt  time.Time
 }
 
 type cliClient struct {
@@ -305,6 +305,16 @@ func (c *cliClient) clearPendingTool() {
 	c.pending = nil
 }
 
+func toolResultTimeout() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("FREEBUFF_TOOL_TIMEOUT")); raw != "" {
+		if value, err := time.ParseDuration(raw); err == nil && value >= time.Second {
+			return value
+		}
+		log.Printf("[warn] invalid FREEBUFF_TOOL_TIMEOUT=%q; using %s", raw, staleToolResultTimeout)
+	}
+	return staleToolResultTimeout
+}
+
 func (c *cliClient) resetProcess() {
 	if c.scanStop != nil {
 		close(c.scanStop)
@@ -337,10 +347,11 @@ func (c *cliClient) pendingSession() string {
 func (c *cliClient) recoverExpiredToolCall(now time.Time) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.pending == nil || now.Sub(c.pending.CreatedAt) < staleToolResultTimeout {
+	if c.pending == nil || !c.pending.ExpiredAt.IsZero() || now.Sub(c.pending.CreatedAt) < toolResultTimeout() {
 		return false
 	}
-	c.resetProcess()
+	c.pending.ExpiredAt = now
+	log.Printf("[warn] tool call expired: session=%s tool_call_id=%s age=%s", c.pending.SessionID, c.pending.ToolCallID, now.Sub(c.pending.CreatedAt).Round(time.Second))
 	return true
 }
 
@@ -402,6 +413,16 @@ func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, c
 		if c.pending == nil {
 			return cliChatResult{}, errors.New("no pending tool call for tool result")
 		}
+		if !c.pending.ExpiredAt.IsZero() {
+			age := time.Since(c.pending.CreatedAt).Round(time.Second)
+			toolCallID := c.pending.ToolCallID
+			log.Printf("[warn] rejecting expired tool result: session=%s tool_call_id=%s age=%s", sessionID, toolCallID, age)
+			// The headless process is still blocked on the old request. Once the
+			// caller is told to restart the turn, discard that process as well so
+			// its stale request cannot poison the next conversation.
+			c.resetProcess()
+			return cliChatResult{}, fmt.Errorf("tool call %s expired after %s, retry the full conversation turn", toolCallID, age)
+		}
 		if c.pending.SessionID != sessionID || c.pending.ToolCallID != toolResult.ToolCallID {
 			if c.pending.SessionID == sessionID {
 				c.resetProcess()
@@ -420,8 +441,10 @@ func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, c
 				// pending tool chain. If it still happens, the child state is no
 				// longer trustworthy; reset it so this account cannot poison every
 				// later request until an operator restarts the gateway.
-				c.resetProcess()
-				return cliChatResult{}, errors.New("headless CLI reset: another external tool call was waiting for its result")
+				return cliChatResult{}, errors.New("conversation session conflict: another session is waiting for a tool result")
+			}
+			if !c.pending.ExpiredAt.IsZero() {
+				return cliChatResult{}, fmt.Errorf("tool call %s expired, retry the full conversation turn", c.pending.ToolCallID)
 			}
 			// The same Agent resumed without returning the requested tool result.
 			// Its local run cannot safely continue, so start a clean headless process.
@@ -476,6 +499,7 @@ func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, c
 					onDelta(event.Text)
 				}
 			case "result":
+				log.Printf("[info] cli result: session=%s request_id=%s tool_pending=%t", sessionID, id, c.pending != nil)
 				if toolResult != nil {
 					c.clearPendingTool()
 				} else {
@@ -1064,6 +1088,10 @@ func writeError(w http.ResponseWriter, status int, message, code string) {
 func upstreamErrorStatus(message string) (int, string) {
 	lower := strings.ToLower(message)
 	switch {
+	case strings.Contains(lower, "tool call") && strings.Contains(lower, "expired"):
+		return http.StatusConflict, "tool_call_expired"
+	case strings.Contains(lower, "session conflict") || strings.Contains(lower, "waiting for a tool result"):
+		return http.StatusConflict, "session_conflict"
 	case strings.Contains(lower, "rate_limit"), strings.Contains(lower, "rate limit"),
 		strings.Contains(lower, "quota"), strings.Contains(lower, "budget"), strings.Contains(lower, "429"):
 		return http.StatusTooManyRequests, "upstream_rate_limited"
@@ -1185,6 +1213,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	id := fmt.Sprintf("chatcmpl-cli-%d", time.Now().UnixNano())
 	created := time.Now().Unix()
 	selection := s.sessions.resolve(request, r.Header.Get("X-Freebuff-Session-ID"), model)
+	log.Printf("[info] chat request: id=%s session=%s model=%s stream=%t tool_result=%t messages=%d", id, selection.ID, model, request.Stream, toolResult != nil, len(request.Messages))
 	if selection.FallbackKey != "" && !s.accounts.sessionIdle(selection.ID, model) {
 		s.sessions.discardFallback(selection.FallbackKey)
 		selection = sessionSelection{ID: newAutoSessionID(), Automatic: true, FallbackKey: shortFallbackKey(request, model)}
@@ -1210,6 +1239,11 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		started := false
 		outputChars := 0
 		onDelta := func(delta string) {
+			// Whitespace-only deltas commonly precede a tool_call. Forwarding
+			// those as content confuses strict streaming parsers such as Hermes.
+			if strings.TrimSpace(delta) == "" {
+				return
+			}
 			outputChars += len([]rune(delta))
 			payload := map[string]any{
 				"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
