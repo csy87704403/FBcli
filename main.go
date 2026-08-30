@@ -620,6 +620,32 @@ func promptFromMessages(messages []chatMessage) string {
 	return "System instructions:\n" + strings.Join(instructions, "\n\n") + "\n\nUser message:\n" + lastUser
 }
 
+// Rebuild context when failover selects a fresh CLI session. Normal turns use
+// the native session history and continue sending only the current prompt.
+func fullPromptFromMessages(messages []chatMessage, tools []openAITool) string {
+	var transcript []string
+	for _, message := range messages {
+		role := strings.TrimSpace(message.Role)
+		if role == "" {
+			continue
+		}
+		if text := strings.TrimSpace(contentText(message.Content)); text != "" {
+			transcript = append(transcript, strings.ToUpper(role)+":\n"+text)
+		}
+		if len(message.ToolCalls) > 0 {
+			encoded, _ := json.Marshal(message.ToolCalls)
+			transcript = append(transcript, "ASSISTANT_TOOL_CALLS:\n"+string(encoded))
+		}
+		if role == "tool" && message.ToolCallID != "" {
+			transcript = append(transcript, "TOOL_CALL_ID: "+message.ToolCallID)
+		}
+	}
+	if len(transcript) == 0 {
+		return ""
+	}
+	return addToolContract("Conversation history from the API caller. Continue the same conversation and preserve this context.\n\n"+strings.Join(transcript, "\n\n"), tools)
+}
+
 func lastToolResult(messages []chatMessage) *chatMessage {
 	if len(messages) == 0 {
 		return nil
@@ -1162,6 +1188,16 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if selection.FallbackKey != "" && !s.accounts.sessionIdle(selection.ID, model) {
 		s.sessions.discardFallback(selection.FallbackKey)
 		selection = sessionSelection{ID: newAutoSessionID(), Automatic: true, FallbackKey: shortFallbackKey(request, model)}
+	}
+	if !s.accounts.sessionIdle(selection.ID, model) && len(request.Messages) > 1 {
+		prompt = fullPromptFromMessages(request.Messages, request.Tools)
+		content, err = multimodalContent(request.Messages, prompt)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error(), "invalid_image")
+			return
+		}
+		// A fresh account process cannot accept a tool result from the old one.
+		toolResult = nil
 	}
 	inputChars := len(prompt)
 	requestContext, cancel := context.WithTimeout(r.Context(), maxGatewayRequestTime)
