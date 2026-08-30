@@ -386,8 +386,11 @@ func (m *accountManager) finish(accountID, model, sessionID string, requestErr e
 	if strings.Contains(lower, "rate_limit") || strings.Contains(lower, "rate limit") ||
 		strings.Contains(lower, "budget") || strings.Contains(lower, "quota") || strings.Contains(lower, "429") {
 		runtime.cooldownUntil = time.Now().Add(15 * time.Minute)
-	} else if strings.Contains(lower, "not authenticated") || strings.Contains(lower, "unauthorized") || strings.Contains(lower, "401") {
+	} else if strings.Contains(lower, "banned") || strings.Contains(lower, "free_mode_cli_required") ||
+		strings.Contains(lower, "unauthorized") || strings.Contains(lower, "not authenticated") || strings.Contains(lower, "401") {
 		runtime.cooldownUntil = time.Now().Add(30 * time.Minute)
+	} else if strings.Contains(lower, "model_locked") || strings.Contains(lower, "model locked") || strings.Contains(lower, "locked to") {
+		runtime.cooldownUntil = time.Now().Add(2 * time.Minute)
 	}
 	m.mu.Unlock()
 	m.store.mu.Lock()
