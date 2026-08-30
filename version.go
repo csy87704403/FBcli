@@ -1,4 +1,4 @@
 package main
 
 // gatewayVersion is updated for every published deployment bundle.
-const gatewayVersion = "v41"
+const gatewayVersion = "v42"

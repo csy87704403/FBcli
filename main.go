@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -34,8 +35,8 @@ const (
 	// The CLI may wait while an external agent executes a tool. Keep the default
 	// generous, while allowing deployments to tune it without rebuilding.
 	staleToolResultTimeout = 5 * time.Minute
-	maxExternalToolCalls   = 48
-	maxRepeatedToolCalls   = 5
+	maxExternalToolCalls   = 96
+	maxRepeatedToolCalls   = 12
 	maxGatewayRequestTime  = 12 * time.Minute
 	headlessStartTimeout   = 30 * time.Second
 )
@@ -315,6 +316,16 @@ func toolResultTimeout() time.Duration {
 	return staleToolResultTimeout
 }
 
+func toolCallLimit(name string, fallback int) int {
+	if raw := strings.TrimSpace(os.Getenv(name)); raw != "" {
+		if value, err := strconv.Atoi(raw); err == nil && value > 0 {
+			return value
+		}
+		log.Printf("[warn] invalid %s=%q; using %d", name, raw, fallback)
+	}
+	return fallback
+}
+
 func (c *cliClient) resetProcess() {
 	if c.scanStop != nil {
 		close(c.scanStop)
@@ -364,7 +375,7 @@ func (c *cliClient) setPendingToolCall(requestID, sessionID string, call openAIT
 		c.lastToolCall = fingerprint
 		c.repeatedToolCall = 1
 	}
-	if c.toolCalls > maxExternalToolCalls || c.repeatedToolCall > maxRepeatedToolCalls {
+	if c.toolCalls > toolCallLimit("FREEBUFF_MAX_TOOL_CALLS", maxExternalToolCalls) || c.repeatedToolCall > toolCallLimit("FREEBUFF_MAX_REPEATED_TOOL_CALLS", maxRepeatedToolCalls) {
 		c.resetProcess()
 		return errors.New("external tool-call loop detected; the CLI session was reset")
 	}
@@ -444,11 +455,14 @@ func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, c
 				return cliChatResult{}, errors.New("conversation session conflict: another session is waiting for a tool result")
 			}
 			if !c.pending.ExpiredAt.IsZero() {
-				return cliChatResult{}, fmt.Errorf("tool call %s expired, retry the full conversation turn", c.pending.ToolCallID)
+				log.Printf("[warn] rebuilding expired tool session: session=%s tool_call_id=%s", sessionID, c.pending.ToolCallID)
+				c.resetProcess()
 			}
-			// The same Agent resumed without returning the requested tool result.
-			// Its local run cannot safely continue, so start a clean headless process.
-			c.resetProcess()
+			if c.pending != nil {
+				// The same Agent resumed without returning the requested tool result.
+				// Its local run cannot safely continue, so start a clean process.
+				c.resetProcess()
+			}
 		}
 		id = fmt.Sprintf("req-%d", time.Now().UnixNano())
 		request = map[string]any{
@@ -499,12 +513,12 @@ func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, c
 					onDelta(event.Text)
 				}
 			case "result":
-				log.Printf("[info] cli result: session=%s request_id=%s tool_pending=%t", sessionID, id, c.pending != nil)
 				if toolResult != nil {
 					c.clearPendingTool()
 				} else {
 					c.clearToolState()
 				}
+				log.Printf("[info] cli result: session=%s request_id=%s tool_pending=%t", sessionID, id, c.pending != nil)
 				if c.proxyRestartPending {
 					c.proxyRestartPending = false
 					c.resetProcess()
@@ -1092,6 +1106,8 @@ func upstreamErrorStatus(message string) (int, string) {
 		return http.StatusConflict, "tool_call_expired"
 	case strings.Contains(lower, "session conflict") || strings.Contains(lower, "waiting for a tool result"):
 		return http.StatusConflict, "session_conflict"
+	case strings.Contains(lower, "conversation account is busy"):
+		return http.StatusTooManyRequests, "session_busy"
 	case strings.Contains(lower, "rate_limit"), strings.Contains(lower, "rate limit"),
 		strings.Contains(lower, "quota"), strings.Contains(lower, "budget"), strings.Contains(lower, "429"):
 		return http.StatusTooManyRequests, "upstream_rate_limited"
@@ -1295,12 +1311,15 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	result, err := s.chatWithIPCapFailover(requestContext, model, selection, prompt, content, request.Tools, toolResult, nil, func() bool { return toolResult == nil })
 	if err != nil {
 		s.sessions.forget(selection.ID)
-		if strings.Contains(err.Error(), "no authenticated account") || strings.Contains(err.Error(), "conversation account") || strings.Contains(err.Error(), "cooling down") {
+		if strings.Contains(err.Error(), "no authenticated account") || strings.Contains(err.Error(), "cooling down") {
 			writeError(w, http.StatusServiceUnavailable, err.Error(), "account_unavailable")
 			return
 		}
 		s.admin.recordUsage(model, apiKeyFromRequest(r), inputChars, 0, false, time.Since(startedAt), err)
 		status, errorType := upstreamErrorStatus(err.Error())
+		if status == http.StatusTooManyRequests {
+			w.Header().Set("Retry-After", "5")
+		}
 		writeError(w, status, err.Error(), errorType)
 		return
 	}
