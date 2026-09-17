@@ -232,8 +232,101 @@ func TestAccountSessionIdleRejectsActiveSession(t *testing.T) {
 		t.Fatal("active account session was considered idle")
 	}
 	manager.finish(accountID, defaultModel, "hermes-short", nil)
+	if manager.sessionIdle("hermes-short", defaultModel) {
+		t.Fatal("a stopped CLI process cannot resume its in-memory session")
+	}
+	client := manager.runtimes[accountID].client
+	client.processMu.Lock()
+	client.processPID = 12345 // Simulate a live headless process without starting one.
+	client.processMu.Unlock()
+	client.sessions = map[string]bool{scopedSessionID(defaultModel, "hermes-short"): true}
 	if !manager.sessionIdle("hermes-short", defaultModel) {
-		t.Fatal("completed account session was not considered idle")
+		t.Fatal("completed account session with a live CLI was not considered idle")
+	}
+}
+
+func TestResetActiveSessionReturnsConflictAndKeepsBinding(t *testing.T) {
+	dir := t.TempDir()
+	accountDir := filepath.Join(dir, "one")
+	writeTestCredential(t, accountDir, "one@example.com")
+	store := &stateStore{path: filepath.Join(dir, "state.json"), state: gatewayState{Accounts: []accountConfig{{ID: "one", ConfigDir: accountDir, Enabled: true}}}}
+	manager := newAccountManager(store, "headless", "", dir, filepath.Join(dir, "accounts"))
+	key := accountSessionKey("active-session")
+	manager.sessionAccounts[key] = accountSessionBinding{AccountID: "one", Updated: time.Now()}
+	manager.runtimes["one"].active = 1
+	if err := manager.resetSession("active-session"); err == nil || !strings.Contains(err.Error(), "active") {
+		t.Fatalf("active reset error = %v", err)
+	}
+	if _, found := manager.sessionAccounts[key]; !found {
+		t.Fatal("active session binding was removed after rejected reset")
+	}
+}
+
+func TestResetSessionRejectsPendingSharedAccountCLI(t *testing.T) {
+	dir := t.TempDir()
+	accountDir := filepath.Join(dir, "one")
+	writeTestCredential(t, accountDir, "one@example.com")
+	store := &stateStore{path: filepath.Join(dir, "state.json"), state: gatewayState{Accounts: []accountConfig{{ID: "one", ConfigDir: accountDir, Enabled: true}}}}
+	manager := newAccountManager(store, "headless", "", dir, filepath.Join(dir, "accounts"))
+	manager.sessionAccounts[accountSessionKey("first")] = accountSessionBinding{AccountID: "one", Updated: time.Now()}
+	manager.sessionAccounts[accountSessionKey("second")] = accountSessionBinding{AccountID: "one", Updated: time.Now()}
+	manager.runtimes["one"].client.pending = &pendingToolCall{SessionID: scopedSessionID(defaultModel, "second"), CreatedAt: time.Now()}
+	if err := manager.resetSession("first"); err == nil || !strings.Contains(err.Error(), "waiting for a tool result") {
+		t.Fatalf("shared account reset error = %v", err)
+	}
+	if _, found := manager.sessionAccounts[accountSessionKey("first")]; !found {
+		t.Fatal("rejected reset removed the session binding")
+	}
+	if _, found := manager.sessionAccounts[accountSessionKey("second")]; !found {
+		t.Fatal("rejected reset removed the other session binding")
+	}
+	if got := manager.runtimes["one"].client.pendingSession(); got == "" {
+		t.Fatal("shared account CLI tool state was stopped")
+	}
+}
+
+func TestResetSessionKeepsOtherBindingOnSameAccount(t *testing.T) {
+	dir := t.TempDir()
+	accountDir := filepath.Join(dir, "one")
+	writeTestCredential(t, accountDir, "one@example.com")
+	store := &stateStore{path: filepath.Join(dir, "state.json"), state: gatewayState{Accounts: []accountConfig{{ID: "one", ConfigDir: accountDir, Enabled: true}}}}
+	manager := newAccountManager(store, "headless", "", dir, filepath.Join(dir, "accounts"))
+	firstKey := accountSessionKey("first")
+	secondKey := accountSessionKey("second")
+	manager.sessionAccounts[firstKey] = accountSessionBinding{AccountID: "one", Updated: time.Now()}
+	manager.sessionAccounts[secondKey] = accountSessionBinding{AccountID: "one", Updated: time.Now()}
+	if err := manager.resetSession("first"); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := manager.sessionAccounts[firstKey]; found {
+		t.Fatal("reset session binding was retained")
+	}
+	if _, found := manager.sessionAccounts[secondKey]; !found {
+		t.Fatal("reset removed another session on the same account")
+	}
+}
+
+func TestSessionGCPreservesActiveAndPendingBindings(t *testing.T) {
+	dir := t.TempDir()
+	accountDir := filepath.Join(dir, "one")
+	writeTestCredential(t, accountDir, "one@example.com")
+	old := time.Now().Add(-2 * time.Hour)
+	store := &stateStore{path: filepath.Join(dir, "state.json"), state: gatewayState{Accounts: []accountConfig{{ID: "one", ConfigDir: accountDir, Enabled: true}}}}
+	manager := newAccountManager(store, "headless", "", dir, filepath.Join(dir, "accounts"))
+	activeKey := accountSessionKey("active")
+	pendingKey := accountSessionKey("pending")
+	manager.sessionAccounts[activeKey] = accountSessionBinding{AccountID: "one", Updated: old}
+	manager.sessionAccounts[pendingKey] = accountSessionBinding{AccountID: "one", Updated: old}
+	manager.runtimes["one"].active = 1
+	manager.reapIdleProcessesOnce(time.Now())
+	if _, found := manager.sessionAccounts[activeKey]; !found {
+		t.Fatal("GC removed an active binding")
+	}
+	manager.runtimes["one"].active = 0
+	manager.runtimes["one"].client.pending = &pendingToolCall{SessionID: scopedSessionID(defaultModel, "pending"), CreatedAt: time.Now()}
+	manager.reapIdleProcessesOnce(time.Now())
+	if _, found := manager.sessionAccounts[pendingKey]; !found {
+		t.Fatal("GC removed a pending-tool binding")
 	}
 }
 
@@ -278,8 +371,8 @@ func TestExpiredToolCallIsMarkedExpired(t *testing.T) {
 	if !client.recoverExpiredToolCall(time.Now()) {
 		t.Fatal("expired tool call was not marked expired")
 	}
-	if client.pending == nil || client.pending.ExpiredAt.IsZero() {
-		t.Fatal("expired tool call was not marked expired")
+	if client.pending != nil || client.expiredTools[""].ExpiredAt.IsZero() {
+		t.Fatal("expired tool must release pending state and retain its expiration record")
 	}
 }
 
@@ -304,6 +397,32 @@ func TestLimitedAccountEntersCooldown(t *testing.T) {
 	manager.finish(accountID, defaultModel, "limited-session", &testError{"free session rate_limited"})
 	if !manager.runtimes[accountID].cooldownUntil.After(time.Now()) {
 		t.Fatal("rate-limited account did not enter cooldown")
+	}
+}
+
+func TestAdmissionBanCoolsAccountAndSelectsAnother(t *testing.T) {
+	dir := t.TempDir()
+	oneDir, twoDir := filepath.Join(dir, "one"), filepath.Join(dir, "two")
+	writeTestCredential(t, oneDir, "one@example.com")
+	writeTestCredential(t, twoDir, "two@example.com")
+	store := &stateStore{path: filepath.Join(dir, "state.json"), state: gatewayState{Accounts: []accountConfig{
+		{ID: "one", ConfigDir: oneDir, Enabled: true}, {ID: "two", ConfigDir: twoDir, Enabled: true},
+	}}}
+	manager := newAccountManager(store, "headless", "", dir, filepath.Join(dir, "accounts"))
+	_, first, err := manager.acquire("banned-session", defaultModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.finish(first, defaultModel, "banned-session", &testError{"free session admission returned banned"})
+	if !manager.runtimes[first].cooldownUntil.After(time.Now()) {
+		t.Fatal("admission ban did not cool the account")
+	}
+	_, next, err := manager.acquire("next-session", defaultModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next == first {
+		t.Fatalf("admission-banned account was selected again: %s", next)
 	}
 }
 

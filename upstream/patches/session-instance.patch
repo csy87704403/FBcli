@@ -1,0 +1,21 @@
+diff --git a/cli/src/utils/freebuff-session-api.ts b/cli/src/utils/freebuff-session-api.ts
+--- a/cli/src/utils/freebuff-session-api.ts
++++ b/cli/src/utils/freebuff-session-api.ts
+@@ -111,7 +111,7 @@ export async function callFreebuffSession(
+   } = {},
+ ): Promise<FreebuffSessionServerResponse> {
+   const headers: Record<string, string> = { Authorization: `Bearer ${token}` }
+-  if (method === 'GET' && opts.instanceId) {
++  if ((method === 'GET' || method === 'DELETE') && opts.instanceId) {
+     headers[FREEBUFF_INSTANCE_HEADER] = opts.instanceId
+   }
+   if (method === 'GET' && opts.compact) {
+@@ -251,7 +251,7 @@ export async function releaseFreebuffSlot(): Promise<void> {
+   if (!token) return
+ 
+   try {
+-    await callFreebuffSession('DELETE', token)
++    await callFreebuffSession('DELETE', token, { instanceId: current?.instanceId })
+   } catch {
+     // The server-side sweep is the backstop.
+   }

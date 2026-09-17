@@ -3,8 +3,10 @@ package main
 import (
 	"fmt"
 	"regexp"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestGatewayVersionIsReleaseTag(t *testing.T) {
@@ -39,6 +41,65 @@ func TestGatewayModelListMatchesOfficialFreebuffPicker(t *testing.T) {
 		if model["id"] != want[index] || model["x_freebuff_admission"] != "official" {
 			t.Fatalf("model %d = %#v, want %q", index, model, want[index])
 		}
+		if model["context_length"] != defaultContextLimit || model["x_freebuff_context_reserve"] != defaultContextReserve {
+			t.Fatalf("model %d missing context metadata: %#v", index, model)
+		}
+	}
+}
+
+func TestGatewayModelListUsesGatewayBudgetMetadata(t *testing.T) {
+	t.Setenv("FREEBUFF_CONTEXT_LIMIT", "10000")
+	t.Setenv("FREEBUFF_CONTEXT_RESERVE", "500")
+	model := gatewayModelList()[0]
+	if model["context_length"] != 10000 || model["x_freebuff_context_reserve"] != 500 {
+		t.Fatalf("model budget metadata = %#v", model)
+	}
+	if _, found := model["max_tokens"]; found {
+		t.Fatal("gateway reserve was advertised as upstream max_tokens")
+	}
+}
+
+func TestEstimateContextTokensIncludesTools(t *testing.T) {
+	request := chatRequest{Messages: []chatMessage{{Role: "user", Content: strings.Repeat("x", 400)}}, Tools: []openAITool{{Type: "function", Function: openAIFunction{Name: "inspect", Parameters: []byte(`{"type":"object"}`)}}}}
+	if got := estimateContextTokens(request); got < 100 {
+		t.Fatalf("estimated tokens = %d, want tool and message payload included", got)
+	}
+}
+
+func TestEstimateContextTokensProtectsNonASCII(t *testing.T) {
+	request := chatRequest{Messages: []chatMessage{{Role: "user", Content: strings.Repeat("中", 400)}}}
+	if got := estimateContextTokens(request); got < 400 {
+		t.Fatalf("non-ASCII estimate = %d, want at least rune count", got)
+	}
+}
+
+func TestConversationRouterDetectsMessageDrop(t *testing.T) {
+	router := newConversationRouter()
+	if router.observeExternal("hermes-main", 869, false) {
+		t.Fatal("first observation cannot be a reset")
+	}
+	if !router.observeExternal("hermes-main", 2, false) {
+		t.Fatal("expected large message drop to trigger reset")
+	}
+	if router.observeExternal("hermes-main", 1, true) {
+		t.Fatal("tool result should not trigger implicit reset")
+	}
+}
+
+func TestSessionIdleTTLIsConfigurable(t *testing.T) {
+	t.Setenv("FREEBUFF_SESSION_IDLE_TTL", "45m")
+	if got := sessionIdleTTL(); got != 45*time.Minute {
+		t.Fatalf("session idle ttl = %s, want 45m", got)
+	}
+}
+
+func TestAccountFailoverDefaultsEnabledAndCanDisable(t *testing.T) {
+	if !accountFailoverEnabled() {
+		t.Fatal("account failover should default to enabled")
+	}
+	t.Setenv("FREEBUFF_ACCOUNT_FAILOVER", "false")
+	if accountFailoverEnabled() {
+		t.Fatal("account failover should be disableable")
 	}
 }
 

@@ -10,12 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -118,6 +120,19 @@ const (
 	accountCooldown   = 5 * time.Minute
 )
 
+func accountFailoverEnabled() bool {
+	raw := strings.TrimSpace(os.Getenv("FREEBUFF_ACCOUNT_FAILOVER"))
+	if raw == "" {
+		return true
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		log.Printf("[warn] invalid FREEBUFF_ACCOUNT_FAILOVER=%q; using true", raw)
+		return true
+	}
+	return value
+}
+
 type accountSessionBinding struct {
 	AccountID string    `json:"account_id"`
 	Updated   time.Time `json:"updated_at"`
@@ -179,7 +194,7 @@ func newAccountManager(store *stateStore, cliPath, loginCLIPath, cwd, accountsRo
 			admissionCooldown: cooldowns,
 		}
 	}
-	cutoff := time.Now().Add(-sessionBindingTTL)
+	cutoff := time.Now().Add(-sessionIdleTTL())
 	for sessionID, binding := range persistedBindings {
 		if binding.Updated.After(cutoff) && manager.runtimes[binding.AccountID] != nil {
 			manager.sessionAccounts[sessionID] = binding
@@ -193,45 +208,79 @@ func (m *accountManager) reapIdleProcesses() {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
-		var clients []*cliClient
-		cutoff := time.Now().Add(-sessionBindingTTL)
-		bindingsChanged := false
-		m.mu.Lock()
-		for accountID, runtime := range m.runtimes {
-			runtime.client.recoverExpiredToolCall(time.Now())
-			hasBinding := false
-			for _, binding := range m.sessionAccounts {
-				if binding.AccountID == accountID {
-					hasBinding = true
-					break
-				}
-			}
-			if runtime.active == 0 && !hasBinding && !runtime.lastUsed.IsZero() && time.Since(runtime.lastUsed) >= time.Minute {
-				clients = append(clients, runtime.client)
-			}
+		m.reapIdleProcessesOnce(time.Now())
+	}
+}
+
+func (m *accountManager) reapIdleProcessesOnce(now time.Time) {
+	var clients []*accountRuntime
+	preservedBindings := make(map[string]struct{})
+	cutoff := now.Add(-sessionIdleTTL())
+	bindingsChanged := false
+	m.mu.Lock()
+	for accountID, runtime := range m.runtimes {
+		// Never take a client lock while an account is serving a request.
+		// cliClient.chat holds that lock for the whole request lifetime.
+		if runtime.active > 0 {
+			continue
 		}
+		runtime.client.recoverExpiredToolCall(now)
+		pendingSession := runtime.client.pendingSession()
+		hasBinding := pendingSession != ""
 		for sessionID, binding := range m.sessionAccounts {
-			if binding.Updated.Before(cutoff) {
-				delete(m.sessionAccounts, sessionID)
-				bindingsChanged = true
-			}
-		}
-		m.mu.Unlock()
-		for _, client := range clients {
-			client.stop()
-		}
-		if bindingsChanged {
-			m.store.mu.Lock()
-			for sessionID, binding := range m.store.state.AccountSessions {
-				if binding.Updated.Before(cutoff) {
-					delete(m.store.state.AccountSessions, sessionID)
+			if binding.AccountID == accountID {
+				hasBinding = true
+				// Persisted bindings intentionally contain only a hash of the
+				// external session. Once a CLI tool call is pending we cannot
+				// safely reverse that hash, so retain every binding for this
+				// account until the tool chain is completed.
+				if binding.Updated.Before(cutoff) && pendingSession != "" {
+					preservedBindings[sessionID] = struct{}{}
 				}
 			}
-			err := m.store.saveLocked()
-			m.store.mu.Unlock()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "prune account session bindings: %v\n", err)
+		}
+		if !hasBinding && !runtime.lastUsed.IsZero() && now.Sub(runtime.lastUsed) >= time.Minute {
+			// Reserve the idle runtime while the lock is released for process
+			// teardown. Otherwise acquire() could start a request and then have
+			// its CLI killed by this GC pass.
+			runtime.reconfiguring = true
+			clients = append(clients, runtime)
+		}
+	}
+	for sessionID, binding := range m.sessionAccounts {
+		runtime := m.runtimes[binding.AccountID]
+		pending := ""
+		if runtime != nil && runtime.active == 0 {
+			pending = runtime.client.pendingSession()
+		}
+		if binding.Updated.Before(cutoff) && (runtime == nil || runtime.active == 0) && pending == "" {
+			delete(m.sessionAccounts, sessionID)
+			bindingsChanged = true
+		} else {
+			preservedBindings[sessionID] = struct{}{}
+		}
+	}
+	m.mu.Unlock()
+	for _, runtime := range clients {
+		runtime.client.stop()
+		m.mu.Lock()
+		runtime.reconfiguring = false
+		m.mu.Unlock()
+	}
+	if bindingsChanged {
+		m.store.mu.Lock()
+		for sessionID, binding := range m.store.state.AccountSessions {
+			if binding.Updated.Before(cutoff) {
+				if _, keep := preservedBindings[sessionID]; keep {
+					continue
+				}
+				delete(m.store.state.AccountSessions, sessionID)
 			}
+		}
+		err := m.store.saveLocked()
+		m.store.mu.Unlock()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "prune account session bindings: %v\n", err)
 		}
 	}
 }
@@ -246,6 +295,26 @@ func modelAffinityRank(activeModel, requestedModel string) int {
 	return 2
 }
 
+func accountHealthRank(runtime *accountRuntime, requestedModel string) int {
+	if runtime == nil {
+		return 100
+	}
+	rank := 0
+	if runtime.lastError != "" {
+		rank += 10
+	}
+	if runtime.activeModel != "" && runtime.activeModel != requestedModel {
+		rank += 2
+	}
+	if runtime.lastUsed.IsZero() {
+		return rank
+	}
+	if age := time.Since(runtime.lastUsed); age < time.Minute {
+		rank++
+	}
+	return rank
+}
+
 func (m *accountManager) acquire(sessionID, requestedModel string) (*cliClient, string, error) {
 	rawSessionID := sessionID
 	cliSessionID := scopedSessionID(requestedModel, rawSessionID)
@@ -256,7 +325,7 @@ func (m *accountManager) acquire(sessionID, requestedModel string) (*cliClient, 
 		return nil, "", errors.New("account configuration is being updated")
 	}
 	now := time.Now()
-	if binding, found := m.sessionAccounts[sessionID]; found && binding.Updated.After(now.Add(-sessionBindingTTL)) {
+	if binding, found := m.sessionAccounts[sessionID]; found && binding.Updated.After(now.Add(-sessionIdleTTL())) {
 		runtime := m.runtimes[binding.AccountID]
 		if runtime == nil || runtime.reconfiguring || !runtime.config.Enabled || !readAccountCredential(runtime.config.ConfigDir).Authenticated {
 			m.mu.Unlock()
@@ -290,19 +359,20 @@ func (m *accountManager) acquire(sessionID, requestedModel string) (*cliClient, 
 	delete(m.sessionAccounts, sessionID)
 	var selected *accountRuntime
 	for _, runtime := range m.runtimes {
-		runtime.client.recoverExpiredToolCall(now)
 		if runtime.reconfiguring || !runtime.config.Enabled || runtime.active > 0 || runtime.cooldownUntil.After(now) || runtime.admissionCooldown[runtime.config.Proxy].After(now) {
 			continue
 		}
 		if !readAccountCredential(runtime.config.ConfigDir).Authenticated {
 			continue
 		}
+		runtime.client.recoverExpiredToolCall(now)
 		if pendingSession := runtime.client.pendingSession(); pendingSession != "" && pendingSession != cliSessionID {
 			continue
 		}
-		if selected == nil || runtime.active < selected.active ||
-			(runtime.active == selected.active && modelAffinityRank(runtime.activeModel, requestedModel) < modelAffinityRank(selected.activeModel, requestedModel)) ||
-			(runtime.active == selected.active && modelAffinityRank(runtime.activeModel, requestedModel) == modelAffinityRank(selected.activeModel, requestedModel) && runtime.lastUsed.Before(selected.lastUsed)) {
+		if selected == nil || accountHealthRank(runtime, requestedModel) < accountHealthRank(selected, requestedModel) ||
+			(accountHealthRank(runtime, requestedModel) == accountHealthRank(selected, requestedModel) && runtime.active < selected.active) ||
+			(accountHealthRank(runtime, requestedModel) == accountHealthRank(selected, requestedModel) && runtime.active == selected.active && modelAffinityRank(runtime.activeModel, requestedModel) < modelAffinityRank(selected.activeModel, requestedModel)) ||
+			(accountHealthRank(runtime, requestedModel) == accountHealthRank(selected, requestedModel) && runtime.active == selected.active && modelAffinityRank(runtime.activeModel, requestedModel) == modelAffinityRank(selected.activeModel, requestedModel) && runtime.lastUsed.Before(selected.lastUsed)) {
 			selected = runtime
 		}
 	}
@@ -334,15 +404,157 @@ func (m *accountManager) sessionIdle(sessionID, requestedModel string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	binding, found := m.sessionAccounts[key]
-	if !found || binding.Updated.Before(time.Now().Add(-sessionBindingTTL)) {
+	if !found || binding.Updated.Before(time.Now().Add(-sessionIdleTTL())) {
 		return false
 	}
 	runtime := m.runtimes[binding.AccountID]
 	if runtime == nil || runtime.active > 0 || runtime.reconfiguring || !runtime.config.Enabled {
 		return false
 	}
-	pending := runtime.client.pendingSession()
-	return pending == "" || pending == cliSessionID
+	// A persisted account binding does not mean the headless process still has
+	// its in-memory run. After a gateway restart (or child crash), the caller's
+	// full message history must seed the next CLI request.
+	return runtime.client.canResume(cliSessionID)
+}
+
+// Tool callbacks are continuations of a specific pending run, never fresh
+// prompts. Reject lost/expired callbacks before account fallback can replay them.
+func (m *accountManager) toolResultError(sessionID, model, toolID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, runtime := range m.runtimes {
+		if runtime.active > 0 || runtime.reconfiguring {
+			continue
+		}
+		runtime.client.recoverExpiredToolCall(time.Now())
+		runtime.client.mu.Lock()
+		call, expired := runtime.client.expiredTools[toolID]
+		runtime.client.mu.Unlock()
+		if expired {
+			return fmt.Errorf("tool call %s expired after %s, retry the full conversation turn", toolID, call.ExpiredAt.Sub(call.CreatedAt).Round(time.Second))
+		}
+	}
+	binding, found := m.sessionAccounts[accountSessionKey(sessionID)]
+	if !found {
+		return errors.New("conversation session conflict: tool call no longer has a live session; retry the full conversation turn")
+	}
+	runtime := m.runtimes[binding.AccountID]
+	if runtime == nil || runtime.active > 0 || runtime.reconfiguring {
+		return errors.New("conversation session conflict: account is busy or unavailable")
+	}
+	runtime.client.mu.Lock()
+	defer runtime.client.mu.Unlock()
+	call := runtime.client.pending
+	if call == nil || call.SessionID != scopedSessionID(model, sessionID) || call.ToolCallID != toolID {
+		return errors.New("conversation session conflict: tool result does not match a live tool call; retry the full conversation turn")
+	}
+	return nil
+}
+
+// resetSession clears one external session's account binding and asks the
+// headless CLI to drop only that run. Active or tool-waiting sessions are
+// rejected so reset never interrupts an in-flight request.
+func (m *accountManager) resetSession(sessionID string) error {
+	key := accountSessionKey(sessionID)
+	var client *cliClient
+	var binding accountSessionBinding
+	shouldStop := false
+	foundBinding := false
+	m.mu.Lock()
+	if found, ok := m.sessionAccounts[key]; ok {
+		foundBinding = true
+		binding = found
+		if runtime := m.runtimes[binding.AccountID]; runtime != nil {
+			if runtime.reconfiguring {
+				m.mu.Unlock()
+				return errors.New("conversation account is being reconfigured")
+			}
+			if runtime.active > 0 {
+				m.mu.Unlock()
+				return errors.New("conversation session is active")
+			}
+			if runtime.client.pendingSession() != "" {
+				m.mu.Unlock()
+				return errors.New("conversation account is waiting for a tool result")
+			}
+			runtime.reconfiguring = true
+			client = runtime.client
+			shouldStop = true
+		}
+	}
+	m.mu.Unlock()
+	if client != nil {
+		if err := client.resetExternalSession(sessionID); err != nil {
+			m.mu.Lock()
+			if runtime := m.runtimes[binding.AccountID]; runtime != nil {
+				runtime.reconfiguring = false
+			}
+			m.mu.Unlock()
+			return fmt.Errorf("reset CLI session: %w", err)
+		}
+	}
+	m.mu.Lock()
+	delete(m.sessionAccounts, key)
+	m.mu.Unlock()
+	m.store.mu.Lock()
+	previous, existed := m.store.state.AccountSessions[key]
+	delete(m.store.state.AccountSessions, key)
+	err := m.store.saveLocked()
+	if err != nil && existed {
+		m.store.state.AccountSessions[key] = previous
+	}
+	m.store.mu.Unlock()
+	if err != nil {
+		log.Printf("[warn] persist session reset: %v", err)
+		if foundBinding {
+			m.mu.Lock()
+			if runtime := m.runtimes[binding.AccountID]; runtime != nil && shouldStop {
+				runtime.reconfiguring = false
+			}
+			if _, exists := m.sessionAccounts[key]; !exists {
+				m.sessionAccounts[key] = binding
+			}
+			m.mu.Unlock()
+		}
+		return fmt.Errorf("persist session reset: %w", err)
+	}
+	if client != nil && shouldStop {
+		m.mu.Lock()
+		if runtime := m.runtimes[binding.AccountID]; runtime != nil {
+			runtime.reconfiguring = false
+		}
+		m.mu.Unlock()
+	}
+	return nil
+}
+
+func (m *accountManager) sessionStatus(sessionID string) map[string]any {
+	key := accountSessionKey(sessionID)
+	m.mu.Lock()
+	binding, found := m.sessionAccounts[key]
+	if !found {
+		m.mu.Unlock()
+		return nil
+	}
+	runtime := m.runtimes[binding.AccountID]
+	result := map[string]any{"account_id": binding.AccountID, "updated_at": binding.Updated, "active": false}
+	if runtime != nil {
+		result["active"] = runtime.active > 0
+		result["last_error"] = runtime.lastError
+		running, pid, started := runtime.client.processStatus()
+		result["cli_running"] = running
+		if pid > 0 {
+			result["cli_pid"] = pid
+		}
+		if !started.IsZero() {
+			result["cli_started_at"] = started
+		}
+		// Avoid waiting on cliClient.mu while chat() owns it for an active
+		// request. A subsequent status poll will report pending_tool once idle.
+		result["pending_tool"] = runtime.active == 0 && runtime.client.pendingSession() != ""
+	}
+	m.mu.Unlock()
+	return result
 }
 
 func accountSessionKey(sessionID string) string {

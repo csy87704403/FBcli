@@ -87,7 +87,7 @@ func newStateStore(path, legacyConfig, legacyPool string) (*stateStore, error) {
 				return nil, saveErr
 			}
 		}
-		if prunePersistedSessionBindings(&store.state, time.Now().Add(-sessionBindingTTL)) {
+		if prunePersistedSessionBindings(&store.state, time.Now().Add(-sessionIdleTTL())) {
 			if err := store.saveLocked(); err != nil {
 				return nil, err
 			}

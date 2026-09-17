@@ -5,3 +5,4 @@ freebuff-*-linux-*
 data/
 accounts/
 freebuff-cli-gateway-state.json*
+output/

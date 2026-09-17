@@ -18,11 +18,13 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -39,6 +41,9 @@ const (
 	maxRepeatedToolCalls   = 12
 	maxGatewayRequestTime  = 12 * time.Minute
 	headlessStartTimeout   = 30 * time.Second
+	headlessResetTimeout   = 10 * time.Second
+	defaultContextLimit    = 131072
+	defaultContextReserve  = 8192
 )
 
 // gatewayModels mirrors the public Freebuff CLI picker. It is a catalog, not a
@@ -61,6 +66,11 @@ func gatewayModelList() []map[string]any {
 		models = append(models, map[string]any{
 			"id": model, "object": "model", "owned_by": "freebuff-cli",
 			"x_freebuff_admission": "official",
+			// These are gateway safeguards, not claims about the upstream model's
+			// native context window or output limit.
+			"context_length":             contextLimit(),
+			"x_freebuff_context_reserve": contextReserve(),
+			"capabilities":               []string{"chat", "tools", "streaming"},
 		})
 	}
 	return models
@@ -95,11 +105,12 @@ type openAIToolCall struct {
 }
 
 type chatRequest struct {
-	Model    string        `json:"model"`
-	Messages []chatMessage `json:"messages"`
-	Stream   bool          `json:"stream"`
-	Tools    []openAITool  `json:"tools"`
-	User     string        `json:"user"`
+	Model     string        `json:"model"`
+	Messages  []chatMessage `json:"messages"`
+	Stream    bool          `json:"stream"`
+	Tools     []openAITool  `json:"tools"`
+	User      string        `json:"user"`
+	MaxTokens int           `json:"max_tokens,omitempty"`
 }
 
 type cliEvent struct {
@@ -138,7 +149,15 @@ type conversationRouter struct {
 	byHistory  map[string]sessionBinding
 	byToolCall map[string]sessionBinding
 	byFallback map[string]sessionBinding
+	external   map[string]sessionObservation
 	store      *stateStore
+}
+
+type sessionObservation struct {
+	MessageCount    int
+	EstimatedTokens int
+	Created         time.Time
+	Updated         time.Time
 }
 
 type pendingToolCall struct {
@@ -151,6 +170,7 @@ type pendingToolCall struct {
 }
 
 type cliClient struct {
+	histories           map[string][][32]byte
 	path                string
 	cwd                 string
 	configDir           string
@@ -162,6 +182,8 @@ type cliClient struct {
 	events              chan cliScanResult
 	scanStop            chan struct{}
 	pending             *pendingToolCall
+	expiredTools        map[string]pendingToolCall
+	sessions            map[string]bool
 	toolCalls           int
 	lastToolCall        string
 	repeatedToolCall    int
@@ -295,6 +317,54 @@ func (c *cliClient) stop() {
 	c.resetProcess()
 }
 
+// resetExternalSession removes only the requested run from the headless CLI.
+// Keeping the account process alive is safe when other sessions use it.
+func (c *cliClient) resetExternalSession(externalSessionID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cmd == nil || c.cmd.Process == nil || c.stdin == nil || c.events == nil {
+		return nil
+	}
+	timeout := time.NewTimer(headlessResetTimeout)
+	defer timeout.Stop()
+	for _, model := range gatewayModels {
+		delete(c.sessions, scopedSessionID(model, externalSessionID))
+		id := fmt.Sprintf("reset-%d", time.Now().UnixNano())
+		request := map[string]any{"id": id, "type": "reset", "session_id": scopedSessionID(model, externalSessionID)}
+		data, _ := json.Marshal(request)
+		if _, err := c.stdin.Write(append(data, '\n')); err != nil {
+			return err
+		}
+		for {
+			var scanned cliScanResult
+			var ok bool
+			select {
+			case <-timeout.C:
+				c.resetProcess()
+				return errors.New("headless CLI reset timed out")
+			case scanned, ok = <-c.events:
+				if !ok {
+					return errors.New("headless CLI closed its output while resetting session")
+				}
+			}
+			if scanned.err != nil {
+				return scanned.err
+			}
+			var event cliEvent
+			if err := json.Unmarshal(scanned.line, &event); err != nil || event.ID != id {
+				continue
+			}
+			if event.Type == "reset_ok" {
+				break
+			}
+			if event.Type == "error" {
+				return errors.New(event.Message)
+			}
+		}
+	}
+	return nil
+}
+
 func (c *cliClient) clearToolState() {
 	c.pending = nil
 	c.toolCalls = 0
@@ -339,6 +409,8 @@ func (c *cliClient) resetProcess() {
 		_, _, _ = c.cmd.ProcessState, c.cmd.Process, c.cmd.Wait()
 	}
 	c.cmd, c.stdin, c.scanner, c.events = nil, nil, nil, nil
+	c.sessions = nil
+	c.histories = nil
 	c.clearToolState()
 	c.processMu.Lock()
 	c.processPID = 0
@@ -358,12 +430,37 @@ func (c *cliClient) pendingSession() string {
 func (c *cliClient) recoverExpiredToolCall(now time.Time) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.pending == nil || !c.pending.ExpiredAt.IsZero() || now.Sub(c.pending.CreatedAt) < toolResultTimeout() {
+	for id, call := range c.expiredTools {
+		if now.Sub(call.ExpiredAt) > 30*time.Minute {
+			delete(c.expiredTools, id)
+		}
+	}
+	if c.pending == nil || now.Sub(c.pending.CreatedAt) < toolResultTimeout() {
 		return false
 	}
 	c.pending.ExpiredAt = now
 	log.Printf("[warn] tool call expired: session=%s tool_call_id=%s age=%s", c.pending.SessionID, c.pending.ToolCallID, now.Sub(c.pending.CreatedAt).Round(time.Second))
+	if c.expiredTools == nil {
+		c.expiredTools = make(map[string]pendingToolCall)
+	}
+	if len(c.expiredTools) >= maxToolCallBindings {
+		var oldest string
+		for id, call := range c.expiredTools {
+			if oldest == "" || call.ExpiredAt.Before(c.expiredTools[oldest].ExpiredAt) {
+				oldest = id
+			}
+		}
+		delete(c.expiredTools, oldest)
+	}
+	c.expiredTools[c.pending.ToolCallID] = *c.pending
+	c.resetProcess()
 	return true
+}
+
+func (c *cliClient) canResume(sessionID string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.sessions[sessionID] && (c.pending == nil || c.pending.SessionID == sessionID)
 }
 
 func (c *cliClient) setPendingToolCall(requestID, sessionID string, call openAIToolCall) error {
@@ -415,12 +512,24 @@ func newToolCall(event cliEvent) openAIToolCall {
 	return call
 }
 
-func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, content []map[string]any, tools []openAITool, toolResult *chatMessage, onDelta func(string)) (cliChatResult, error) {
+func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, content []map[string]any, tools []openAITool, toolResult *chatMessage, onDelta func(string), histories ...[]chatMessage) (cliChatResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	var incoming [][32]byte
+	if len(histories) > 0 {
+		incoming = messageHashes(histories[0])
+	}
+	if toolResult == nil && c.sessions[sessionID] && !historyExtends(c.histories[sessionID], incoming) {
+		// Client history is authoritative: edits, compaction and /new invalidate
+		// native history even when the message count has not changed.
+		c.resetProcess()
+	}
 	id := ""
 	var request map[string]any
 	if toolResult != nil {
+		if call, found := c.expiredTools[toolResult.ToolCallID]; found {
+			return cliChatResult{}, fmt.Errorf("tool call %s expired after %s, retry the full conversation turn", call.ToolCallID, call.ExpiredAt.Sub(call.CreatedAt).Round(time.Second))
+		}
 		if c.pending == nil {
 			return cliChatResult{}, errors.New("no pending tool call for tool result")
 		}
@@ -465,6 +574,14 @@ func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, c
 			}
 		}
 		id = fmt.Sprintf("req-%d", time.Now().UnixNano())
+		if !c.sessions[sessionID] && len(histories) > 0 && len(histories[0]) > 1 {
+			prompt = fullPromptFromMessages(histories[0], tools)
+			var err error
+			content, err = multimodalContent(histories[0], prompt)
+			if err != nil {
+				return cliChatResult{}, err
+			}
+		}
 		request = map[string]any{
 			"id": id, "type": "chat", "model": model,
 			"session_id": sessionID, "prompt": prompt, "cwd": c.cwd,
@@ -513,6 +630,11 @@ func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, c
 					onDelta(event.Text)
 				}
 			case "result":
+				c.rememberHistory(sessionID, incoming)
+				if c.sessions == nil {
+					c.sessions = make(map[string]bool)
+				}
+				c.sessions[sessionID] = true
 				if toolResult != nil {
 					c.clearPendingTool()
 				} else {
@@ -528,10 +650,15 @@ func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, c
 				}
 				return cliChatResult{Text: streamed.String()}, nil
 			case "tool_call":
+				c.rememberHistory(sessionID, incoming)
 				call := newToolCall(event)
 				if err := c.setPendingToolCall(id, sessionID, call); err != nil {
 					return cliChatResult{}, err
 				}
+				if c.sessions == nil {
+					c.sessions = make(map[string]bool)
+				}
+				c.sessions[sessionID] = true
 				return cliChatResult{ToolCalls: []openAIToolCall{call}}, nil
 			case "error":
 				c.clearToolState()
@@ -575,6 +702,57 @@ func contentText(content any) string {
 	default:
 		return ""
 	}
+}
+
+func contextLimit() int {
+	if raw := strings.TrimSpace(os.Getenv("FREEBUFF_CONTEXT_LIMIT")); raw != "" {
+		if value, err := strconv.Atoi(raw); err == nil && value > 0 {
+			return value
+		}
+		log.Printf("[warn] invalid FREEBUFF_CONTEXT_LIMIT=%q; using %d", raw, defaultContextLimit)
+	}
+	return defaultContextLimit
+}
+
+func contextReserve() int {
+	if raw := strings.TrimSpace(os.Getenv("FREEBUFF_CONTEXT_RESERVE")); raw != "" {
+		if value, err := strconv.Atoi(raw); err == nil && value >= 0 {
+			return value
+		}
+		log.Printf("[warn] invalid FREEBUFF_CONTEXT_RESERVE=%q; using %d", raw, defaultContextReserve)
+	}
+	return defaultContextReserve
+}
+
+// estimateContextTokens intentionally errs high enough to protect the runtime
+// when callers omit tokenizer metadata. JSON size captures tool schemas and
+// tool results, which plain text-only estimates would miss.
+func estimateContextTokens(request chatRequest) int {
+	data, _ := json.Marshal(struct {
+		Messages []chatMessage `json:"messages"`
+		Tools    []openAITool  `json:"tools,omitempty"`
+	}{request.Messages, request.Tools})
+	if len(data) == 0 {
+		return 0
+	}
+	byByte := (len(data) + 3) / 4
+	byRune := utf8.RuneCount(data)
+	if byRune > byByte {
+		return byRune
+	}
+	return byByte
+}
+
+func contextInputLimit(request chatRequest) int {
+	reserve := contextReserve()
+	if request.MaxTokens > 0 {
+		reserve = request.MaxTokens
+	}
+	limit := contextLimit() - reserve
+	if limit < 1 {
+		return 0
+	}
+	return limit
 }
 
 func imageURL(item map[string]any) string {
@@ -813,17 +991,28 @@ const (
 	maxHistoryBindings      = 512
 )
 
+func sessionIdleTTL() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("FREEBUFF_SESSION_IDLE_TTL")); raw != "" {
+		if value, err := time.ParseDuration(raw); err == nil && value >= time.Minute {
+			return value
+		}
+		log.Printf("[warn] invalid FREEBUFF_SESSION_IDLE_TTL=%q; using %s", raw, sessionBindingTTL)
+	}
+	return sessionBindingTTL
+}
+
 func newConversationRouter(stores ...*stateStore) *conversationRouter {
 	router := &conversationRouter{
 		byHistory:  make(map[string]sessionBinding),
 		byToolCall: make(map[string]sessionBinding),
 		byFallback: make(map[string]sessionBinding),
+		external:   make(map[string]sessionObservation),
 	}
 	if len(stores) == 0 || stores[0] == nil {
 		return router
 	}
 	router.store = stores[0]
-	cutoff := time.Now().Add(-sessionBindingTTL)
+	cutoff := time.Now().Add(-sessionIdleTTL())
 	router.store.mu.RLock()
 	for key, binding := range router.store.state.ConversationSessions {
 		if binding.Updated.After(cutoff) {
@@ -833,6 +1022,79 @@ func newConversationRouter(stores ...*stateStore) *conversationRouter {
 	router.store.mu.RUnlock()
 	go router.reapExpired()
 	return router
+}
+
+func sessionDropRatio() float64 {
+	if raw := strings.TrimSpace(os.Getenv("FREEBUFF_SESSION_DROP_RATIO")); raw != "" {
+		if value, err := strconv.ParseFloat(raw, 64); err == nil && value > 0 && value < 1 {
+			return value
+		}
+		log.Printf("[warn] invalid FREEBUFF_SESSION_DROP_RATIO=%q; using 0.5", raw)
+	}
+	return 0.5
+}
+
+func sessionDropMinimum() int {
+	if raw := strings.TrimSpace(os.Getenv("FREEBUFF_SESSION_DROP_MIN_MESSAGES")); raw != "" {
+		if value, err := strconv.Atoi(raw); err == nil && value > 0 {
+			return value
+		}
+		log.Printf("[warn] invalid FREEBUFF_SESSION_DROP_MIN_MESSAGES=%q; using 100", raw)
+	}
+	return 100
+}
+
+// observeExternal records client-side history size and detects an implicit
+// reset (Hermes /new keeps the same X-Freebuff-Session-ID).
+func (router *conversationRouter) observeExternal(id string, messageCount int, toolResult bool) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	now := time.Now()
+	router.mu.Lock()
+	previous, found := router.external[id]
+	created := previous.Created
+	if created.IsZero() {
+		created = now
+	}
+	router.external[id] = sessionObservation{MessageCount: messageCount, EstimatedTokens: previous.EstimatedTokens, Created: created, Updated: now}
+	router.mu.Unlock()
+	if toolResult || !found || previous.MessageCount < sessionDropMinimum() || messageCount >= previous.MessageCount {
+		return false
+	}
+	if float64(messageCount) > float64(previous.MessageCount)*sessionDropRatio() {
+		return false
+	}
+	log.Printf("[warn] client session reset detected: session=%s messages=%d->%d", id, previous.MessageCount, messageCount)
+	return true
+}
+
+func (router *conversationRouter) setExternalTokenEstimate(id string, estimatedTokens int) {
+	router.mu.Lock()
+	if observation, ok := router.external[id]; ok {
+		observation.EstimatedTokens = estimatedTokens
+		router.external[id] = observation
+	}
+	router.mu.Unlock()
+}
+
+func (router *conversationRouter) externalResetNeeded(id string, messageCount int, toolResult bool) bool {
+	id = strings.TrimSpace(id)
+	if id == "" || toolResult {
+		return false
+	}
+	router.mu.Lock()
+	previous, found := router.external[id]
+	router.mu.Unlock()
+	if !found || previous.MessageCount < sessionDropMinimum() || messageCount >= previous.MessageCount {
+		return false
+	}
+	if float64(messageCount) > float64(previous.MessageCount)*sessionDropRatio() {
+		return false
+	}
+	log.Printf("[warn] client session reset detected: session=%s messages=%d->%d", id, previous.MessageCount, messageCount)
+	return true
 }
 
 func (router *conversationRouter) persist(key string, binding sessionBinding, save bool) {
@@ -871,7 +1133,7 @@ func (router *conversationRouter) reapExpired() {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
-		cutoff := time.Now().Add(-sessionBindingTTL)
+		cutoff := time.Now().Add(-sessionIdleTTL())
 		changed := false
 		router.mu.Lock()
 		for key, binding := range router.byHistory {
@@ -888,6 +1150,11 @@ func (router *conversationRouter) reapExpired() {
 		for key, binding := range router.byFallback {
 			if binding.Updated.Before(time.Now().Add(-shortSessionFallbackTTL)) {
 				delete(router.byFallback, key)
+			}
+		}
+		for id, observation := range router.external {
+			if observation.Updated.Before(cutoff) {
+				delete(router.external, id)
 			}
 		}
 		router.mu.Unlock()
@@ -968,6 +1235,65 @@ func (router *conversationRouter) completeToolResult(toolCallID string) {
 	router.mu.Unlock()
 }
 
+func (router *conversationRouter) resetSession(sessionID string) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return
+	}
+	removedHistory := make([]string, 0)
+	router.mu.Lock()
+	delete(router.external, sessionID)
+	for _, model := range gatewayModels {
+		internal := scopedSessionID(model, sessionID)
+		for key, binding := range router.byHistory {
+			if binding.ID == sessionID || binding.ID == internal {
+				delete(router.byHistory, key)
+				removedHistory = append(removedHistory, key)
+			}
+		}
+		for key, binding := range router.byFallback {
+			if binding.ID == sessionID || binding.ID == internal {
+				delete(router.byFallback, key)
+			}
+		}
+		for toolCallID, binding := range router.byToolCall {
+			if binding.ID == sessionID || binding.ID == internal {
+				delete(router.byToolCall, toolCallID)
+			}
+		}
+	}
+	router.mu.Unlock()
+	if router.store == nil || len(removedHistory) == 0 {
+		return
+	}
+	router.store.mu.Lock()
+	for _, key := range removedHistory {
+		delete(router.store.state.ConversationSessions, key)
+	}
+	if err := router.store.saveLocked(); err != nil {
+		log.Printf("persist session reset: %v", err)
+	}
+	router.store.mu.Unlock()
+}
+
+func (router *conversationRouter) sessionStatus(sessionID string) (sessionObservation, bool) {
+	router.mu.Lock()
+	defer router.mu.Unlock()
+	observation, ok := router.external[strings.TrimSpace(sessionID)]
+	return observation, ok
+}
+
+func (router *conversationRouter) sessionIDs() []string {
+	router.mu.Lock()
+	defer router.mu.Unlock()
+	result := make([]string, 0, len(router.external))
+	for id := range router.external {
+		result = append(result, id)
+	}
+	sort.Strings(result)
+	return result
+}
+
 // forget removes all automatic routes pointing at a failed CLI session.  A
 // restarted headless process no longer owns that in-memory run, so retaining
 // the route would only make the next request resume broken context.
@@ -1020,23 +1346,24 @@ func (router *conversationRouter) bind(request chatRequest, result cliChatResult
 		return
 	}
 	router.mu.Lock()
+	ambiguousHistory := false
 	if found {
 		if existing, ok := router.byHistory[key]; ok && existing.ID != selection.ID {
 			// The same shortened history can belong to more than one conversation.
 			// Fail closed rather than attaching one agent run to another's context.
-			binding := sessionBinding{Updated: time.Now()}
-			router.byHistory[key] = binding
-			router.mu.Unlock()
-			router.persist(key, binding, true)
-			return
+			ambiguousHistory = true
 		}
 	}
 	binding := sessionBinding{ID: selection.ID, Updated: time.Now()}
+	historyBinding := binding
+	if ambiguousHistory {
+		historyBinding.ID = ""
+	}
 	if selection.FallbackKey != "" {
 		router.byFallback[selection.FallbackKey] = binding
 	}
 	if found {
-		router.byHistory[key] = binding
+		router.byHistory[key] = historyBinding
 	}
 	for _, toolCall := range result.ToolCalls {
 		if toolCall.ID != "" {
@@ -1056,7 +1383,7 @@ func (router *conversationRouter) bind(request chatRequest, result cliChatResult
 	if len(router.byHistory) <= maxHistoryBindings {
 		router.mu.Unlock()
 		if found {
-			router.persist(key, binding, true)
+			router.persist(key, historyBinding, true)
 		}
 		return
 	}
@@ -1074,7 +1401,7 @@ func (router *conversationRouter) bind(request chatRequest, result cliChatResult
 		delete(router.store.state.ConversationSessions, oldestKey)
 		router.store.mu.Unlock()
 	}
-	router.persist(key, binding, true)
+	router.persist(key, historyBinding, true)
 }
 
 func (router *conversationRouter) count() int {
@@ -1084,9 +1411,68 @@ func (router *conversationRouter) count() int {
 }
 
 type server struct {
-	accounts *accountManager
-	sessions *conversationRouter
-	admin    *adminService
+	tenantsMu sync.Mutex
+	tenants   map[string]*server
+	namespace string
+	accounts  *accountManager
+	sessions  *conversationRouter
+	admin     *adminService
+}
+
+func (s *server) sessionStatus(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "session id is required", "invalid_request")
+		return
+	}
+	observation, found := s.sessions.sessionStatus(id)
+	account := s.accounts.sessionStatus(s.accountSession(id))
+	if !found && account == nil {
+		writeError(w, http.StatusNotFound, "session not found", "session_not_found")
+		return
+	}
+	result := map[string]any{"id": id, "message_count": observation.MessageCount, "estimated_tokens": observation.EstimatedTokens, "created_at": observation.Created, "last_active_at": observation.Updated}
+	for key, value := range account {
+		result[key] = value
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *server) sessionList(w http.ResponseWriter, _ *http.Request) {
+	result := make([]map[string]any, 0)
+	for _, id := range s.sessions.sessionIDs() {
+		observation, _ := s.sessions.sessionStatus(id)
+		item := map[string]any{"id": id, "message_count": observation.MessageCount, "estimated_tokens": observation.EstimatedTokens, "created_at": observation.Created, "last_active_at": observation.Updated}
+		for key, value := range s.accounts.sessionStatus(s.accountSession(id)) {
+			item[key] = value
+		}
+		result = append(result, item)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": result})
+}
+
+func (s *server) sessionCreate(w http.ResponseWriter, _ *http.Request) {
+	id := newAutoSessionID()
+	s.sessions.observeExternal(id, 0, false)
+	writeJSON(w, http.StatusCreated, map[string]any{"id": id})
+}
+
+func (s *server) sessionReset(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "session id is required", "invalid_request")
+		return
+	}
+	if err := s.accounts.resetSession(s.accountSession(id)); err != nil {
+		writeError(w, http.StatusConflict, err.Error(), "session_conflict")
+		return
+	}
+	s.sessions.resetSession(id)
+	writeJSON(w, http.StatusOK, map[string]any{"id": id, "reset": true})
+}
+
+func (s *server) sessionDelete(w http.ResponseWriter, r *http.Request) {
+	s.sessionReset(w, r)
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
@@ -1102,6 +1488,8 @@ func writeError(w http.ResponseWriter, status int, message, code string) {
 func upstreamErrorStatus(message string) (int, string) {
 	lower := strings.ToLower(message)
 	switch {
+	case strings.Contains(lower, "no authenticated account"), strings.Contains(lower, "cooling down"), strings.Contains(lower, "conversation account is unavailable"):
+		return http.StatusServiceUnavailable, "account_unavailable"
 	case strings.Contains(lower, "tool call") && strings.Contains(lower, "expired"):
 		return http.StatusConflict, "tool_call_expired"
 	case strings.Contains(lower, "session conflict") || strings.Contains(lower, "waiting for a tool result"):
@@ -1156,21 +1544,26 @@ func isRecoverableCLIError(err error) bool {
 		strings.Contains(lower, "unexpected eof")
 }
 
-func (s *server) chatWithIPCapFailover(ctx context.Context, model string, selection sessionSelection, prompt string, content []map[string]any, tools []openAITool, toolResult *chatMessage, onDelta func(string), canRetry func() bool) (cliChatResult, error) {
+func shouldAccountFailover(err error) bool {
+	return isSessionAdmissionFailure(err) || isAccountQuotaError(err) || isRecoverableCLIError(err)
+}
+
+func (s *server) chatWithIPCapFailover(ctx context.Context, model string, selection sessionSelection, prompt string, content []map[string]any, messages []chatMessage, tools []openAITool, toolResult *chatMessage, onDelta func(string), canRetry func() bool) (cliChatResult, error) {
+	selection.ID = s.accountSession(selection.ID)
 	client, accountID, err := s.accounts.acquire(selection.ID, model)
 	if err != nil {
 		return cliChatResult{}, err
 	}
-	result, err := client.chat(ctx, model, scopedSessionID(model, selection.ID), prompt, content, tools, toolResult, onDelta)
+	result, err := client.chat(ctx, model, scopedSessionID(model, selection.ID), prompt, content, tools, toolResult, onDelta, messages)
 	s.accounts.finish(accountID, model, selection.ID, err)
 	if err == nil || (canRetry != nil && !canRetry()) {
 		return result, err
 	}
 	if isSessionAdmissionFailure(err) {
+		// "banned" is an account-level admission failure. finish() already
+		// cooled the account for 30 minutes; changing its exit here would
+		// needlessly churn the proxy pool and must not make it retry immediately.
 		s.accounts.markAdmissionFailure(accountID)
-		if s.admin == nil || !s.admin.rotateProxyAfterAdmission(accountID) {
-			s.accounts.coolAccount(accountID)
-		}
 	} else if isIPCapError(err) {
 		if s.admin == nil || !s.admin.rotateProxyAfterIPCap(accountID) {
 			return result, err
@@ -1178,7 +1571,7 @@ func (s *server) chatWithIPCapFailover(ctx context.Context, model string, select
 	} else if isAccountQuotaError(err) {
 		// The failed account is cooled by finish(). A fresh turn can safely
 		// continue on another account; a tool result cannot be replayed.
-		if toolResult != nil {
+		if toolResult != nil || !accountFailoverEnabled() {
 			return result, err
 		}
 		s.accounts.coolAccount(accountID)
@@ -1193,11 +1586,26 @@ func (s *server) chatWithIPCapFailover(ctx context.Context, model string, select
 	} else {
 		return result, err
 	}
+	if shouldAccountFailover(err) && !accountFailoverEnabled() {
+		return result, err
+	}
 	client, accountID, retryAcquireErr := s.accounts.acquire(selection.ID, model)
 	if retryAcquireErr != nil {
 		return cliChatResult{}, retryAcquireErr
 	}
-	result, err = client.chat(ctx, model, scopedSessionID(model, selection.ID), prompt, content, tools, toolResult, onDelta)
+	// A failed account loses its native CLI context. Fresh turns can be safely
+	// replayed on the replacement account, but must carry the complete caller
+	// history or the conversation would silently start from the latest prompt.
+	if toolResult == nil && len(messages) > 1 {
+		prompt = fullPromptFromMessages(messages, tools)
+		if rebuilt, rebuildErr := multimodalContent(messages, prompt); rebuildErr == nil {
+			content = rebuilt
+		} else {
+			s.accounts.finish(accountID, model, selection.ID, rebuildErr)
+			return cliChatResult{}, rebuildErr
+		}
+	}
+	result, err = client.chat(ctx, model, scopedSessionID(model, selection.ID), prompt, content, tools, toolResult, onDelta, messages)
 	s.accounts.finish(accountID, model, selection.ID, err)
 	return result, err
 }
@@ -1210,6 +1618,39 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if err := decoder.Decode(&request); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON request", "invalid_request")
 		return
+	}
+	externalSession := strings.TrimSpace(r.Header.Get("X-Freebuff-Session-ID"))
+	if request.MaxTokens < 0 || request.MaxTokens >= contextLimit() {
+		writeError(w, http.StatusBadRequest, "max_tokens must be positive and smaller than the context limit when supplied", "invalid_request")
+		return
+	}
+	if request.MaxTokens == 0 && contextReserve() >= contextLimit() {
+		writeError(w, http.StatusServiceUnavailable, "configured context reserve leaves no input budget", "invalid_context_configuration")
+		return
+	}
+	resetRequested := strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Freebuff-Session-Reset")), "1") ||
+		strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Freebuff-Session-Reset")), "true")
+	estimatedTokens := estimateContextTokens(request)
+	inputLimit := contextInputLimit(request)
+	if estimatedTokens > inputLimit {
+		message := fmt.Sprintf("estimated context %d tokens exceeds input limit %d (context limit %d, reserve %d); compact or reset the session", estimatedTokens, inputLimit, contextLimit(), contextReserve())
+		log.Printf("[warn] context exceeded: session=%s messages=%d estimated_tokens=%d limit=%d", externalSession, len(request.Messages), estimatedTokens, inputLimit)
+		writeError(w, http.StatusRequestEntityTooLarge, message, "context_exceeded")
+		return
+	}
+	if externalSession != "" {
+		implicitReset := s.sessions.externalResetNeeded(externalSession, len(request.Messages), lastToolResult(request.Messages) != nil)
+		if resetRequested || implicitReset {
+			if err := s.accounts.resetSession(s.accountSession(externalSession)); err != nil {
+				writeError(w, http.StatusConflict, err.Error(), "session_conflict")
+				return
+			}
+			s.sessions.resetSession(externalSession)
+			// resetSession removes the old observation; retain the current
+			// request count so the next turn starts from a known baseline.
+		}
+		s.sessions.observeExternal(externalSession, len(request.Messages), lastToolResult(request.Messages) != nil)
+		s.sessions.setExternalTokenEstimate(externalSession, estimatedTokens)
 	}
 	toolResult := lastToolResult(request.Messages)
 	prompt := addToolContract(promptFromMessages(request.Messages), request.Tools)
@@ -1228,13 +1669,20 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	id := fmt.Sprintf("chatcmpl-cli-%d", time.Now().UnixNano())
 	created := time.Now().Unix()
-	selection := s.sessions.resolve(request, r.Header.Get("X-Freebuff-Session-ID"), model)
+	selection := s.sessions.resolve(request, externalSession, model)
+	if toolResult != nil {
+		if err := s.accounts.toolResultError(s.accountSession(selection.ID), model, toolResult.ToolCallID); err != nil {
+			status, code := upstreamErrorStatus(err.Error())
+			writeError(w, status, err.Error(), code)
+			return
+		}
+	}
 	log.Printf("[info] chat request: id=%s session=%s model=%s stream=%t tool_result=%t messages=%d", id, selection.ID, model, request.Stream, toolResult != nil, len(request.Messages))
-	if selection.FallbackKey != "" && !s.accounts.sessionIdle(selection.ID, model) {
+	if selection.FallbackKey != "" && !s.accounts.sessionIdle(s.accountSession(selection.ID), model) {
 		s.sessions.discardFallback(selection.FallbackKey)
 		selection = sessionSelection{ID: newAutoSessionID(), Automatic: true, FallbackKey: shortFallbackKey(request, model)}
 	}
-	if !s.accounts.sessionIdle(selection.ID, model) && len(request.Messages) > 1 {
+	if toolResult == nil && !s.accounts.sessionIdle(s.accountSession(selection.ID), model) && len(request.Messages) > 1 {
 		prompt = fullPromptFromMessages(request.Messages, request.Tools)
 		content, err = multimodalContent(request.Messages, prompt)
 		if err != nil {
@@ -1254,10 +1702,8 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		flusher, _ := w.(http.Flusher)
 		started := false
 		outputChars := 0
-		onDelta := func(delta string) {
-			// Whitespace-only deltas commonly precede a tool_call. Forwarding
-			// those as content confuses strict streaming parsers such as Hermes.
-			if strings.TrimSpace(delta) == "" {
+		emitDelta := func(delta string) {
+			if delta == "" {
 				return
 			}
 			outputChars += len([]rune(delta))
@@ -1275,11 +1721,20 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				flusher.Flush()
 			}
 		}
-		result, err := s.chatWithIPCapFailover(requestContext, model, selection, prompt, content, request.Tools, toolResult, onDelta, func() bool { return toolResult == nil && outputChars == 0 })
+		textBuffer := streamTextBuffer{emit: emitDelta}
+		result, err := s.chatWithIPCapFailover(requestContext, model, selection, prompt, content, request.Messages, request.Tools, toolResult, textBuffer.push, func() bool { return toolResult == nil && outputChars == 0 && textBuffer.leading == "" })
 		if err != nil {
 			s.sessions.forget(selection.ID)
 			s.admin.recordUsage(model, apiKeyFromRequest(r), inputChars, outputChars, false, time.Since(startedAt), err)
-			_, errorType := upstreamErrorStatus(err.Error())
+			status, errorType := upstreamErrorStatus(err.Error())
+			if !started {
+				w.Header().Del("Content-Type")
+				if status == http.StatusTooManyRequests {
+					w.Header().Set("Retry-After", "5")
+				}
+				writeError(w, status, err.Error(), errorType)
+				return
+			}
 			data, _ := json.Marshal(map[string]any{"error": map[string]any{"message": err.Error(), "type": errorType}})
 			fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", data)
 			return
@@ -1287,6 +1742,11 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if toolResult != nil {
 			s.sessions.completeToolResult(toolResult.ToolCallID)
 		}
+		if !started && result.Text != "" && len(result.ToolCalls) == 0 {
+			textBuffer.leading = ""
+			emitDelta(result.Text)
+		}
+		textBuffer.finish(len(result.ToolCalls) > 0)
 		s.admin.recordUsage(model, apiKeyFromRequest(r), inputChars, outputChars, true, time.Since(startedAt), nil)
 		s.sessions.bind(request, result, selection)
 		finishReason := "stop"
@@ -1308,7 +1768,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := s.chatWithIPCapFailover(requestContext, model, selection, prompt, content, request.Tools, toolResult, nil, func() bool { return toolResult == nil })
+	result, err := s.chatWithIPCapFailover(requestContext, model, selection, prompt, content, request.Messages, request.Tools, toolResult, nil, func() bool { return toolResult == nil })
 	if err != nil {
 		s.sessions.forget(selection.ID)
 		if strings.Contains(err.Error(), "no authenticated account") || strings.Contains(err.Error(), "cooling down") {
@@ -1403,7 +1863,12 @@ func main() {
 	apiMux.HandleFunc("GET /v1/models", service.admin.requireAPIKey(func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": gatewayModelList()})
 	}))
-	apiMux.HandleFunc("POST /v1/chat/completions", service.admin.requireAPIKey(service.chatCompletions))
+	apiMux.HandleFunc("GET /v1/sessions", service.tenantHandler((*server).sessionList))
+	apiMux.HandleFunc("POST /v1/sessions", service.tenantHandler((*server).sessionCreate))
+	apiMux.HandleFunc("GET /v1/sessions/{id}", service.tenantHandler((*server).sessionStatus))
+	apiMux.HandleFunc("POST /v1/sessions/{id}/reset", service.tenantHandler((*server).sessionReset))
+	apiMux.HandleFunc("DELETE /v1/sessions/{id}", service.tenantHandler((*server).sessionDelete))
+	apiMux.HandleFunc("POST /v1/chat/completions", service.tenantHandler((*server).chatCompletions))
 	adminMux := http.NewServeMux()
 	service.admin.register(adminMux)
 	apiServer := &http.Server{Addr: *listen, Handler: apiMux, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 1 << 20}
