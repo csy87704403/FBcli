@@ -552,6 +552,24 @@ func (m *accountManager) sessionStatus(sessionID string) map[string]any {
 		// Avoid waiting on cliClient.mu while chat() owns it for an active
 		// request. A subsequent status poll will report pending_tool once idle.
 		result["pending_tool"] = runtime.active == 0 && runtime.client.pendingSession() != ""
+		if runtime.active == 0 {
+			if state, ok := runtime.client.sessionState(sessionID); ok {
+				if state.Generation > 0 {
+					result["generation"] = state.Generation
+					result["native_generation"] = state.Generation
+				}
+				if state.RebuildReason != "" {
+					result["rebuild_reason"] = state.RebuildReason
+				}
+				if state.InstanceID != "" {
+					result["instance_id"] = state.InstanceID
+					result["upstream_instance_id"] = state.InstanceID
+				}
+				if state.Model != "" {
+					result["model"] = state.Model
+				}
+			}
+		}
 	}
 	m.mu.Unlock()
 	return result

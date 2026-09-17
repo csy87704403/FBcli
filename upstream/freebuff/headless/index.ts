@@ -1,6 +1,9 @@
 import { createInterface } from 'node:readline'
 
-import { getFreebuffBase3RootAgentIdForModel } from '@codebuff/common/constants/free-agents'
+import {
+  FREEBUFF_CLI_BASE3_AGENT_ID_BY_MODEL,
+  getFreebuffBase3RootAgentIdForModel,
+} from '@codebuff/common/constants/free-agents'
 import { DEFAULT_FREEBUFF_MODEL_ID } from '@codebuff/common/constants/freebuff-models'
 import { publishedTools, toolNames } from '@codebuff/common/tools/constants'
 import {
@@ -18,6 +21,39 @@ import {
   callFreebuffSession,
   type FreebuffSessionMethod,
 } from '../../cli/src/utils/freebuff-session-api'
+
+if (process.argv.includes('--catalog')) {
+  const catalog: string[] = []
+  for (const [model, agentId] of Object.entries(FREEBUFF_CLI_BASE3_AGENT_ID_BY_MODEL)) {
+    if (bundledAgents[agentId]) {
+      catalog.push(model)
+    }
+  }
+  let selected = catalog
+  const allowlistEnv =
+    process.env.FREEBUFF_MODEL_ALLOWLIST || process.env.FREEBUFF_ALLOWED_MODELS
+  if (allowlistEnv) {
+    const rawAllowed = allowlistEnv
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+    for (const m of rawAllowed) {
+      if (!catalog.includes(m)) {
+        process.stderr.write(`unknown model in allowlist: ${m}\n`)
+        process.exit(1)
+      }
+    }
+    const allowed = new Set(rawAllowed)
+    selected = catalog.filter((m) => allowed.has(m))
+  }
+  const configuredDefault = process.env.FREEBUFF_DEFAULT_MODEL?.trim() || DEFAULT_FREEBUFF_MODEL_ID
+  if (!selected.includes(configuredDefault)) {
+    process.stderr.write(`allowlist excludes default model ${configuredDefault}\n`)
+    process.exit(1)
+  }
+  process.stdout.write(`${JSON.stringify(selected)}\n`)
+  process.exit(0)
+}
 
 type JsonObject = Record<string, unknown>
 
@@ -313,6 +349,11 @@ async function ensureFreebuffSession(requestedModel: string) {
   const token = requireAuthToken()
 
   const replaceModelSession = async () => {
+    if (!activeSession?.instanceId) {
+      throw new Error(
+        'cannot release model_locked session: no owned session instance ID',
+      )
+    }
     await callSession('DELETE', token)
     activeSession = undefined
     return callSession('POST', token, requestedModel)
@@ -342,6 +383,11 @@ async function ensureFreebuffSession(requestedModel: string) {
 
   let admitted = await callSession('POST', token, requestedModel)
   if (admitted.status === 'model_locked') {
+    if (!activeSession?.instanceId) {
+      throw new Error(
+        'cannot replace locked model session on cold-start: no owned session instance ID',
+      )
+    }
     admitted = await replaceModelSession()
   }
   if (admitted.status !== 'active') {
@@ -390,6 +436,7 @@ async function handleChat(id: string, request: Request): Promise<void> {
     type: 'start',
     session_id: sessionId,
     model: session.model,
+    instance_id: session.instanceId,
   })
 
   const run = await client.run({
@@ -427,7 +474,7 @@ async function handleChat(id: string, request: Request): Promise<void> {
 }
 
 async function releaseSession(): Promise<void> {
-  if (!activeSession) return
+  if (!activeSession?.instanceId) return
   const token = requireAuthToken()
   try {
     await callSession('DELETE', token)

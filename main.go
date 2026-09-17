@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
@@ -33,6 +34,8 @@ const (
 	gptLunaModel     = "openai/gpt-5.6-luna"
 	miniMaxModel     = "minimax/minimax-m3"
 	mimoModel        = "mimo/mimo-v2.5"
+	glmV52Model      = "z-ai/glm-5.2"
+	fableModel       = "anthropic/claude-fable-5"
 
 	// The CLI may wait while an external agent executes a tool. Keep the default
 	// generous, while allowing deployments to tune it without rebuilding.
@@ -52,15 +55,83 @@ const (
 // the limited tier. Keep the catalog stable so a temporary model_unavailable
 // response (notably V4 Flash) never makes clients forget that model exists.
 // The official session admission remains the authority for each actual chat.
-var gatewayModels = []string{
-	deepSeekProModel,
-	defaultModel,
-	gptLunaModel,
-	miniMaxModel,
-	mimoModel,
+var (
+	catalogMu     sync.RWMutex
+	gatewayModels = []string{
+		deepSeekProModel,
+		defaultModel,
+		gptLunaModel,
+		miniMaxModel,
+		mimoModel,
+	}
+)
+
+func knownModel(model string) bool {
+	catalogMu.RLock()
+	defer catalogMu.RUnlock()
+	for _, m := range gatewayModels {
+		if m == model {
+			return true
+		}
+	}
+	return false
+}
+
+func effectiveDefaultModel() string {
+	if configured := strings.TrimSpace(os.Getenv("FREEBUFF_DEFAULT_MODEL")); configured != "" {
+		return configured
+	}
+	return defaultModel
+}
+
+func loadHeadlessCatalog(cliPath string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, cliPath, "--catalog")
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("execute headless --catalog: %w", err)
+	}
+	var models []string
+	if err := json.Unmarshal(output, &models); err != nil {
+		var obj struct {
+			Models []string `json:"models"`
+		}
+		if err2 := json.Unmarshal(output, &obj); err2 != nil || len(obj.Models) == 0 {
+			return fmt.Errorf("parse headless catalog output: %w", err)
+		}
+		models = obj.Models
+	}
+	if len(models) == 0 {
+		return errors.New("headless catalog returned empty model list")
+	}
+	defModel := effectiveDefaultModel()
+	hasDefault := false
+	seen := make(map[string]bool, len(models))
+	for _, m := range models {
+		if strings.TrimSpace(m) == "" {
+			return errors.New("headless catalog contains empty or blank model ID")
+		}
+		if seen[m] {
+			return fmt.Errorf("headless catalog contains duplicate model ID: %q", m)
+		}
+		seen[m] = true
+		if m == defModel {
+			hasDefault = true
+		}
+	}
+	if !hasDefault {
+		return fmt.Errorf("default model %q is not in headless catalog", defModel)
+	}
+	catalogMu.Lock()
+	gatewayModels = models
+	catalogMu.Unlock()
+	return nil
 }
 
 func gatewayModelList() []map[string]any {
+	catalogMu.RLock()
+	defer catalogMu.RUnlock()
 	models := make([]map[string]any, 0, len(gatewayModels))
 	for _, model := range gatewayModels {
 		models = append(models, map[string]any{
@@ -105,15 +176,68 @@ type openAIToolCall struct {
 }
 
 type chatRequest struct {
-	Model     string        `json:"model"`
-	Messages  []chatMessage `json:"messages"`
-	Stream    bool          `json:"stream"`
-	Tools     []openAITool  `json:"tools"`
-	User      string        `json:"user"`
-	MaxTokens int           `json:"max_tokens,omitempty"`
+	SessionID        string        `json:"session_id,omitempty"`
+	MaxTokensPresent bool          `json:"-"`
+	Model            string        `json:"model"`
+	Messages         []chatMessage `json:"messages"`
+	Stream           bool          `json:"stream"`
+	Tools            []openAITool  `json:"tools"`
+	User             string        `json:"user"`
+	MaxTokens        int           `json:"max_tokens,omitempty"`
+}
+
+func (r *chatRequest) UnmarshalJSON(data []byte) error {
+	type rawChatRequest chatRequest
+	var raw rawChatRequest
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&raw); err != nil {
+		return err
+	}
+	*r = chatRequest(raw)
+
+	var fields map[string]json.RawMessage
+	fieldsDec := json.NewDecoder(bytes.NewReader(data))
+	fieldsDec.UseNumber()
+	if err := fieldsDec.Decode(&fields); err != nil {
+		return nil
+	}
+	rawMsg, present := fields["max_tokens"]
+	if !present {
+		r.MaxTokensPresent = false
+		return nil
+	}
+	r.MaxTokensPresent = true
+	rawStr := strings.TrimSpace(string(rawMsg))
+	if rawStr == "" || rawStr == "null" {
+		r.MaxTokens = 0
+		return nil
+	}
+	var num json.Number
+	numDec := json.NewDecoder(bytes.NewReader(rawMsg))
+	numDec.UseNumber()
+	if err := numDec.Decode(&num); err != nil {
+		return fmt.Errorf("invalid max_tokens type: %s", rawStr)
+	}
+	val, err := num.Int64()
+	if err != nil {
+		return fmt.Errorf("invalid max_tokens number: %s", rawStr)
+	}
+	r.MaxTokens = int(val)
+	return nil
+}
+
+type cliSessionState struct {
+	Generation    int       `json:"generation"`
+	RebuildReason string    `json:"rebuild_reason,omitempty"`
+	InstanceID    string    `json:"instance_id,omitempty"`
+	Model         string    `json:"model,omitempty"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 type cliEvent struct {
+	InstanceID string          `json:"instance_id"`
+	Model      string          `json:"model"`
 	ID         string          `json:"id"`
 	Type       string          `json:"type"`
 	Text       string          `json:"text"`
@@ -154,6 +278,9 @@ type conversationRouter struct {
 }
 
 type sessionObservation struct {
+	RequestCount    int
+	SuccessCount    int
+	LastResetReason string
 	MessageCount    int
 	EstimatedTokens int
 	Created         time.Time
@@ -170,6 +297,8 @@ type pendingToolCall struct {
 }
 
 type cliClient struct {
+	states              map[string]cliSessionState
+	aliases             map[string]string
 	histories           map[string][][32]byte
 	path                string
 	cwd                 string
@@ -322,15 +451,31 @@ func (c *cliClient) stop() {
 func (c *cliClient) resetExternalSession(externalSessionID string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.recordRebuildLocked(externalSessionID, "explicit_reset")
+	delete(c.sessions, externalSessionID)
+	if c.histories != nil {
+		delete(c.histories, externalSessionID)
+	}
+	catalogMu.RLock()
+	models := append([]string(nil), gatewayModels...)
+	catalogMu.RUnlock()
+	for _, model := range models {
+		scoped := scopedSessionID(model, externalSessionID)
+		delete(c.sessions, scoped)
+		if c.histories != nil {
+			delete(c.histories, scoped)
+		}
+		c.recordRebuildLocked(scoped, "explicit_reset")
+	}
 	if c.cmd == nil || c.cmd.Process == nil || c.stdin == nil || c.events == nil {
 		return nil
 	}
 	timeout := time.NewTimer(headlessResetTimeout)
 	defer timeout.Stop()
-	for _, model := range gatewayModels {
-		delete(c.sessions, scopedSessionID(model, externalSessionID))
+	for _, model := range models {
+		scoped := scopedSessionID(model, externalSessionID)
 		id := fmt.Sprintf("reset-%d", time.Now().UnixNano())
-		request := map[string]any{"id": id, "type": "reset", "session_id": scopedSessionID(model, externalSessionID)}
+		request := map[string]any{"id": id, "type": "reset", "session_id": scoped}
 		data, _ := json.Marshal(request)
 		if _, err := c.stdin.Write(append(data, '\n')); err != nil {
 			return err
@@ -363,6 +508,94 @@ func (c *cliClient) resetExternalSession(externalSessionID string) error {
 		}
 	}
 	return nil
+}
+
+func (c *cliClient) bindSessionAlias(scopedID, rawID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.aliases == nil {
+		c.aliases = make(map[string]string)
+	}
+	c.aliases[scopedID] = rawID
+}
+
+func (c *cliClient) rawSessionIDLocked(sessionID string) string {
+	if c.aliases != nil {
+		if raw, ok := c.aliases[sessionID]; ok && raw != "" {
+			return raw
+		}
+	}
+	return sessionID
+}
+
+func (c *cliClient) sessionState(id string) (cliSessionState, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.sessionStateLocked(id)
+}
+
+func (c *cliClient) sessionStateLocked(id string) (cliSessionState, bool) {
+	if c.states == nil {
+		return cliSessionState{}, false
+	}
+	if state, ok := c.states[id]; ok {
+		return state, true
+	}
+	catalogMu.RLock()
+	models := append([]string(nil), gatewayModels...)
+	catalogMu.RUnlock()
+	var latest cliSessionState
+	var found bool
+	for _, model := range models {
+		if state, ok := c.states[scopedSessionID(model, id)]; ok {
+			if !found || state.UpdatedAt.After(latest.UpdatedAt) {
+				latest = state
+				found = true
+			}
+		}
+	}
+	return latest, found
+}
+
+func (c *cliClient) recordRebuildLocked(id, reason string) {
+	if c.states == nil {
+		c.states = make(map[string]cliSessionState)
+	}
+	rawID := c.rawSessionIDLocked(id)
+	state := c.states[rawID]
+	state.Generation++
+	if state.Generation <= 1 {
+		state.Generation = 2
+	}
+	state.RebuildReason = reason
+	state.InstanceID = ""
+	state.UpdatedAt = time.Now()
+	c.states[rawID] = state
+	if rawID != id {
+		c.states[id] = state
+	}
+}
+
+func (c *cliClient) setSessionInstanceLocked(id, instanceID, model string) {
+	if c.states == nil {
+		c.states = make(map[string]cliSessionState)
+	}
+	rawID := c.rawSessionIDLocked(id)
+	state := c.states[rawID]
+	if state.Generation == 0 {
+		state.Generation = 1
+	}
+	if instanceID != "" {
+		state.InstanceID = instanceID
+	}
+	if model != "" {
+		state.Model = model
+	}
+	state.UpdatedAt = time.Now()
+	c.states[rawID] = state
+	if rawID != id {
+		c.states[id] = state
+	}
 }
 
 func (c *cliClient) clearToolState() {
@@ -519,9 +752,36 @@ func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, c
 	if len(histories) > 0 {
 		incoming = messageHashes(histories[0])
 	}
-	if toolResult == nil && c.sessions[sessionID] && !historyExtends(c.histories[sessionID], incoming) {
+	rawID := c.rawSessionIDLocked(sessionID)
+	histKey := sessionID
+	if c.histories[histKey] == nil && c.histories[rawID] != nil {
+		histKey = rawID
+	}
+	sessActive := c.sessions[sessionID] || c.sessions[rawID]
+	rebuilt := false
+	if toolResult == nil && sessActive && !historyExtends(c.histories[histKey], incoming) {
 		// Client history is authoritative: edits, compaction and /new invalidate
 		// native history even when the message count has not changed.
+		reason := "history_edit"
+		if state, ok := c.states[rawID]; ok && state.Model != "" && state.Model != model {
+			reason = "model_change"
+		} else if len(incoming) <= 1 {
+			reason = "short_new_conversation"
+		} else if len(incoming) < len(c.histories[histKey]) {
+			reason = "history_compaction"
+		}
+		c.recordRebuildLocked(sessionID, reason)
+		if state, ok := c.states[sessionID]; ok {
+			state.Model = model
+			c.states[sessionID] = state
+		}
+		if rawID != sessionID {
+			if state, ok := c.states[rawID]; ok {
+				state.Model = model
+				c.states[rawID] = state
+			}
+		}
+		rebuilt = true
 		c.resetProcess()
 	}
 	id := ""
@@ -591,6 +851,55 @@ func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, c
 			request["message_content"] = content
 		}
 	}
+	if c.states == nil {
+		c.states = make(map[string]cliSessionState)
+	}
+	rawState, rawExists := c.states[rawID]
+	if state, exists := c.states[sessionID]; !exists {
+		if rawExists {
+			state = rawState
+			if state.Model != "" && state.Model != model && !rebuilt {
+				state.Generation++
+				state.RebuildReason = "model_change"
+				state.InstanceID = ""
+			}
+			state.Model = model
+			state.UpdatedAt = time.Now()
+			c.states[sessionID] = state
+			c.states[rawID] = state
+		} else {
+			c.states[sessionID] = cliSessionState{
+				Generation: 1,
+				Model:      model,
+				UpdatedAt:  time.Now(),
+			}
+			if rawID != sessionID {
+				c.states[rawID] = c.states[sessionID]
+			}
+		}
+	} else if !rebuilt {
+		if state.Model != "" && state.Model != model {
+			state.Generation++
+			state.RebuildReason = "model_change"
+			state.InstanceID = ""
+			state.Model = model
+			state.UpdatedAt = time.Now()
+			c.states[sessionID] = state
+			if rawID != sessionID {
+				c.states[rawID] = state
+			}
+		} else if !c.sessions[sessionID] && state.Generation > 0 && state.RebuildReason == "" {
+			state.Generation++
+			state.RebuildReason = "process_restart"
+			state.InstanceID = ""
+			state.Model = model
+			state.UpdatedAt = time.Now()
+			c.states[sessionID] = state
+			if rawID != sessionID {
+				c.states[rawID] = state
+			}
+		}
+	}
 	if err := c.start(); err != nil {
 		return cliChatResult{}, err
 	}
@@ -624,6 +933,8 @@ func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, c
 				continue
 			}
 			switch event.Type {
+			case "start":
+				c.setSessionInstanceLocked(sessionID, event.InstanceID, event.Model)
 			case "delta":
 				streamed.WriteString(event.Text)
 				if onDelta != nil {
@@ -631,10 +942,15 @@ func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, c
 				}
 			case "result":
 				c.rememberHistory(sessionID, incoming)
+				if rawID != sessionID {
+					c.rememberHistory(rawID, incoming)
+				}
 				if c.sessions == nil {
 					c.sessions = make(map[string]bool)
 				}
 				c.sessions[sessionID] = true
+				c.sessions[rawID] = true
+				c.sessions[scopedSessionID(model, sessionID)] = true
 				if toolResult != nil {
 					c.clearPendingTool()
 				} else {
@@ -651,6 +967,9 @@ func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, c
 				return cliChatResult{Text: streamed.String()}, nil
 			case "tool_call":
 				c.rememberHistory(sessionID, incoming)
+				if rawID != sessionID {
+					c.rememberHistory(rawID, incoming)
+				}
 				call := newToolCall(event)
 				if err := c.setPendingToolCall(id, sessionID, call); err != nil {
 					return cliChatResult{}, err
@@ -659,6 +978,8 @@ func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, c
 					c.sessions = make(map[string]bool)
 				}
 				c.sessions[sessionID] = true
+				c.sessions[rawID] = true
+				c.sessions[scopedSessionID(model, sessionID)] = true
 				return cliChatResult{ToolCalls: []openAIToolCall{call}}, nil
 			case "error":
 				c.clearToolState()
@@ -672,9 +993,12 @@ func (c *cliClient) chat(ctx context.Context, model, sessionID, prompt string, c
 func contentValue(content any) any {
 	if text, ok := content.(string); ok {
 		var value any
-		if json.Unmarshal([]byte(text), &value) == nil {
+		dec := json.NewDecoder(strings.NewReader(text))
+		dec.UseNumber()
+		if dec.Decode(&value) == nil {
 			return value
 		}
+		return text
 	}
 	return content
 }
@@ -720,6 +1044,10 @@ func contextReserve() int {
 			return value
 		}
 		log.Printf("[warn] invalid FREEBUFF_CONTEXT_RESERVE=%q; using %d", raw, defaultContextReserve)
+	}
+	limit := contextLimit()
+	if defaultContextReserve >= limit {
+		return limit / 4
 	}
 	return defaultContextReserve
 }
@@ -899,7 +1227,7 @@ func explicitSessionID(request chatRequest, header string) string {
 	// as a session key would merge those tasks and repeatedly disturb the
 	// official CLI admission/session state. Callers that have a real stable
 	// conversation id should use X-Freebuff-Session-ID.
-	return ""
+	return strings.TrimSpace(request.SessionID)
 }
 
 func newAutoSessionID() string {
@@ -913,7 +1241,7 @@ func newAutoSessionID() string {
 func scopedSessionID(model, raw string) string {
 	model = strings.TrimSpace(model)
 	if model == "" {
-		model = defaultModel
+		model = effectiveDefaultModel()
 	}
 	sum := sha256.Sum256([]byte(model + "\x00" + raw))
 	return "session-" + hex.EncodeToString(sum[:16])
@@ -963,7 +1291,7 @@ func historyKey(request chatRequest) (string, bool) {
 	}
 	model := strings.TrimSpace(request.Model)
 	if model == "" {
-		model = defaultModel
+		model = effectiveDefaultModel()
 	}
 	var seed strings.Builder
 	seed.WriteString(model)
@@ -1054,20 +1382,18 @@ func (router *conversationRouter) observeExternal(id string, messageCount int, t
 	now := time.Now()
 	router.mu.Lock()
 	previous, found := router.external[id]
+	prevMessageCount := previous.MessageCount
 	created := previous.Created
 	if created.IsZero() {
 		created = now
 	}
-	router.external[id] = sessionObservation{MessageCount: messageCount, EstimatedTokens: previous.EstimatedTokens, Created: created, Updated: now}
+	previous.MessageCount, previous.Created, previous.Updated = messageCount, created, now
+	router.external[id] = previous
 	router.mu.Unlock()
-	if toolResult || !found || previous.MessageCount < sessionDropMinimum() || messageCount >= previous.MessageCount {
+	if toolResult || !found || prevMessageCount < sessionDropMinimum() || messageCount >= prevMessageCount {
 		return false
 	}
-	if float64(messageCount) > float64(previous.MessageCount)*sessionDropRatio() {
-		return false
-	}
-	log.Printf("[warn] client session reset detected: session=%s messages=%d->%d", id, previous.MessageCount, messageCount)
-	return true
+	return prevMessageCount-messageCount >= int(float64(prevMessageCount)*sessionDropRatio())
 }
 
 func (router *conversationRouter) setExternalTokenEstimate(id string, estimatedTokens int) {
@@ -1123,7 +1449,7 @@ func shortFallbackKey(request chatRequest, model string) string {
 		return ""
 	}
 	if model = strings.TrimSpace(model); model == "" {
-		model = defaultModel
+		model = effectiveDefaultModel()
 	}
 	sum := sha256.Sum256([]byte("short-fallback\x00" + model + "\x00" + user))
 	return hex.EncodeToString(sum[:16])
@@ -1176,7 +1502,7 @@ func (router *conversationRouter) reapExpired() {
 }
 
 func (router *conversationRouter) resolve(request chatRequest, header string, models ...string) sessionSelection {
-	model := defaultModel
+	model := effectiveDefaultModel()
 	if len(models) > 0 && strings.TrimSpace(models[0]) != "" {
 		model = models[0]
 	}
@@ -1235,15 +1561,55 @@ func (router *conversationRouter) completeToolResult(toolCallID string) {
 	router.mu.Unlock()
 }
 
+func (router *conversationRouter) recordAttempt(id string, messageCount, estimatedTokens int) {
+	router.mu.Lock()
+	defer router.mu.Unlock()
+	now := time.Now()
+	obs := router.external[id]
+	if obs.Created.IsZero() {
+		obs.Created = now
+	}
+	obs.Updated = now
+	obs.MessageCount = messageCount
+	obs.EstimatedTokens = estimatedTokens
+	obs.RequestCount++
+	router.external[id] = obs
+}
+
+func (router *conversationRouter) recordSuccess(id string) {
+	router.mu.Lock()
+	defer router.mu.Unlock()
+	obs, found := router.external[id]
+	if !found {
+		return
+	}
+	obs.SuccessCount++
+	obs.Updated = time.Now()
+	router.external[id] = obs
+}
+
 func (router *conversationRouter) resetSession(sessionID string) {
+	router.resetSessionWithReason(sessionID, "explicit_reset")
+}
+
+func (router *conversationRouter) resetSessionWithReason(sessionID, reason string) {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
 		return
 	}
 	removedHistory := make([]string, 0)
 	router.mu.Lock()
-	delete(router.external, sessionID)
-	for _, model := range gatewayModels {
+	if obs, ok := router.external[sessionID]; ok {
+		obs.MessageCount = 0
+		obs.EstimatedTokens = 0
+		obs.LastResetReason = reason
+		obs.Updated = time.Now()
+		router.external[sessionID] = obs
+	}
+	catalogMu.RLock()
+	models := append([]string(nil), gatewayModels...)
+	catalogMu.RUnlock()
+	for _, model := range models {
 		internal := scopedSessionID(model, sessionID)
 		for key, binding := range router.byHistory {
 			if binding.ID == sessionID || binding.ID == internal {
@@ -1274,6 +1640,22 @@ func (router *conversationRouter) resetSession(sessionID string) {
 		log.Printf("persist session reset: %v", err)
 	}
 	router.store.mu.Unlock()
+}
+
+func observationFields(id string, observation sessionObservation) map[string]any {
+	result := map[string]any{
+		"id":               id,
+		"message_count":    observation.MessageCount,
+		"estimated_tokens": observation.EstimatedTokens,
+		"created_at":       observation.Created,
+		"last_active_at":   observation.Updated,
+		"request_count":    observation.RequestCount,
+		"success_count":    observation.SuccessCount,
+	}
+	if observation.LastResetReason != "" {
+		result["last_reset_reason"] = observation.LastResetReason
+	}
+	return result
 }
 
 func (router *conversationRouter) sessionStatus(sessionID string) (sessionObservation, bool) {
@@ -1431,7 +1813,7 @@ func (s *server) sessionStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "session not found", "session_not_found")
 		return
 	}
-	result := map[string]any{"id": id, "message_count": observation.MessageCount, "estimated_tokens": observation.EstimatedTokens, "created_at": observation.Created, "last_active_at": observation.Updated}
+	result := observationFields(id, observation)
 	for key, value := range account {
 		result[key] = value
 	}
@@ -1442,7 +1824,7 @@ func (s *server) sessionList(w http.ResponseWriter, _ *http.Request) {
 	result := make([]map[string]any, 0)
 	for _, id := range s.sessions.sessionIDs() {
 		observation, _ := s.sessions.sessionStatus(id)
-		item := map[string]any{"id": id, "message_count": observation.MessageCount, "estimated_tokens": observation.EstimatedTokens, "created_at": observation.Created, "last_active_at": observation.Updated}
+		item := observationFields(id, observation)
 		for key, value := range s.accounts.sessionStatus(s.accountSession(id)) {
 			item[key] = value
 		}
@@ -1554,7 +1936,9 @@ func (s *server) chatWithIPCapFailover(ctx context.Context, model string, select
 	if err != nil {
 		return cliChatResult{}, err
 	}
-	result, err := client.chat(ctx, model, scopedSessionID(model, selection.ID), prompt, content, tools, toolResult, onDelta, messages)
+	scopedID := scopedSessionID(model, selection.ID)
+	client.bindSessionAlias(scopedID, selection.ID)
+	result, err := client.chat(ctx, model, scopedID, prompt, content, tools, toolResult, onDelta, messages)
 	s.accounts.finish(accountID, model, selection.ID, err)
 	if err == nil || (canRetry != nil && !canRetry()) {
 		return result, err
@@ -1605,7 +1989,9 @@ func (s *server) chatWithIPCapFailover(ctx context.Context, model string, select
 			return cliChatResult{}, rebuildErr
 		}
 	}
-	result, err = client.chat(ctx, model, scopedSessionID(model, selection.ID), prompt, content, tools, toolResult, onDelta, messages)
+	scopedID = scopedSessionID(model, selection.ID)
+	client.bindSessionAlias(scopedID, selection.ID)
+	result, err = client.chat(ctx, model, scopedID, prompt, content, tools, toolResult, onDelta, messages)
 	s.accounts.finish(accountID, model, selection.ID, err)
 	return result, err
 }
@@ -1620,7 +2006,20 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	externalSession := strings.TrimSpace(r.Header.Get("X-Freebuff-Session-ID"))
-	if request.MaxTokens < 0 || request.MaxTokens >= contextLimit() {
+	if externalSession != "" && strings.TrimSpace(request.SessionID) != "" && externalSession != strings.TrimSpace(request.SessionID) {
+		writeError(w, http.StatusBadRequest, "session_id conflicts with X-Freebuff-Session-ID", "invalid_request")
+		return
+	}
+	externalSession = explicitSessionID(request, externalSession)
+	model := strings.TrimSpace(request.Model)
+	if model == "" {
+		model = effectiveDefaultModel()
+	}
+	if !knownModel(model) {
+		writeError(w, http.StatusNotFound, "model is not supported by the configured headless CLI", "model_not_found")
+		return
+	}
+	if (request.MaxTokensPresent && request.MaxTokens <= 0) || request.MaxTokens < 0 || request.MaxTokens >= contextLimit() {
 		writeError(w, http.StatusBadRequest, "max_tokens must be positive and smaller than the context limit when supplied", "invalid_request")
 		return
 	}
@@ -1641,11 +2040,15 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if externalSession != "" {
 		implicitReset := s.sessions.externalResetNeeded(externalSession, len(request.Messages), lastToolResult(request.Messages) != nil)
 		if resetRequested || implicitReset {
+			reason := "explicit_reset"
+			if implicitReset && !resetRequested {
+				reason = "history_drop"
+			}
 			if err := s.accounts.resetSession(s.accountSession(externalSession)); err != nil {
 				writeError(w, http.StatusConflict, err.Error(), "session_conflict")
 				return
 			}
-			s.sessions.resetSession(externalSession)
+			s.sessions.resetSessionWithReason(externalSession, reason)
 			// resetSession removes the old observation; retain the current
 			// request count so the next turn starts from a known baseline.
 		}
@@ -1663,10 +2066,6 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error(), "invalid_image")
 		return
 	}
-	model := strings.TrimSpace(request.Model)
-	if model == "" {
-		model = defaultModel
-	}
 	id := fmt.Sprintf("chatcmpl-cli-%d", time.Now().UnixNano())
 	created := time.Now().Unix()
 	selection := s.sessions.resolve(request, externalSession, model)
@@ -1682,6 +2081,13 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		s.sessions.discardFallback(selection.FallbackKey)
 		selection = sessionSelection{ID: newAutoSessionID(), Automatic: true, FallbackKey: shortFallbackKey(request, model)}
 	}
+	s.sessions.recordAttempt(selection.ID, len(request.Messages), estimatedTokens)
+	succeeded := false
+	defer func() {
+		if succeeded {
+			s.sessions.recordSuccess(selection.ID)
+		}
+	}()
 	if toolResult == nil && !s.accounts.sessionIdle(s.accountSession(selection.ID), model) && len(request.Messages) > 1 {
 		prompt = fullPromptFromMessages(request.Messages, request.Tools)
 		content, err = multimodalContent(request.Messages, prompt)
@@ -1747,6 +2153,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			emitDelta(result.Text)
 		}
 		textBuffer.finish(len(result.ToolCalls) > 0)
+		succeeded = true
 		s.admin.recordUsage(model, apiKeyFromRequest(r), inputChars, outputChars, true, time.Since(startedAt), nil)
 		s.sessions.bind(request, result, selection)
 		finishReason := "stop"
@@ -1789,6 +2196,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	s.admin.recordUsage(model, apiKeyFromRequest(r), inputChars, len([]rune(result.Text)), true, time.Since(startedAt), nil)
 	s.sessions.bind(request, result, selection)
 	message := map[string]any{"role": "assistant", "content": result.Text}
+	succeeded = true
 	finishReason := "stop"
 	if len(result.ToolCalls) > 0 {
 		message["content"] = nil
@@ -1826,6 +2234,9 @@ func main() {
 	flag.Parse()
 	if strings.TrimSpace(*cliPath) == "" {
 		log.Fatal("set -cli or FREEBUFF_HEADLESS_BIN")
+	}
+	if err := loadHeadlessCatalog(*cliPath); err != nil {
+		log.Fatalf("load headless model catalog: %v", err)
 	}
 	adminUser := strings.TrimSpace(os.Getenv("FREEBUFF_ADMIN_USER"))
 	adminPassword := os.Getenv("FREEBUFF_ADMIN_PASSWORD")
