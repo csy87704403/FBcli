@@ -96,6 +96,7 @@ func TestMain(m *testing.M) {
 	if os.Getenv("FREEBUFF_TEST_JSONL_CHILD") == "1" {
 		fmt.Println(`{"type":"ready"}`)
 		scanner := bufio.NewScanner(os.Stdin)
+		scanner.Buffer(make([]byte, 4096), 8<<20)
 		pendingRequestID := ""
 		for scanner.Scan() {
 			var request map[string]any

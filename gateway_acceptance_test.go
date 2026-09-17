@@ -149,7 +149,7 @@ func TestInvalidOutputBudgetRejectedBeforeSessionMutation(t *testing.T) {
 			t.Fatalf("max_tokens=%d status=%d", maximum, response.Code)
 		}
 	}
-	if contextInputLimit(chatRequest{MaxTokens: 1000}) != 0 {
-		t.Fatal("output reserve expanded input budget")
+	if contextInputLimit(chatRequest{MaxTokens: 1000}) != 750 {
+		t.Fatal("budget helper must cap reserve independently of HTTP validation")
 	}
 }

@@ -140,6 +140,7 @@ func gatewayModelList() []map[string]any {
 			// These are gateway safeguards, not claims about the upstream model's
 			// native context window or output limit.
 			"context_length":             contextLimit(),
+			"max_tokens":                 contextLimit() / 4,
 			"x_freebuff_context_reserve": contextReserve(),
 			"capabilities":               []string{"chat", "tools", "streaming"},
 		})
@@ -1071,12 +1072,20 @@ func estimateContextTokens(request chatRequest) int {
 	return byByte
 }
 
-func contextInputLimit(request chatRequest) int {
+// This caps admission budgeting only; it does not enforce CLI output length.
+func effectiveContextReserve(request chatRequest) int {
 	reserve := contextReserve()
 	if request.MaxTokens > 0 {
 		reserve = request.MaxTokens
 	}
-	limit := contextLimit() - reserve
+	if cap := contextLimit() / 4; reserve > cap {
+		reserve = cap
+	}
+	return reserve
+}
+
+func contextInputLimit(request chatRequest) int {
+	limit := contextLimit() - effectiveContextReserve(request)
 	if limit < 1 {
 		return 0
 	}
@@ -2032,7 +2041,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	estimatedTokens := estimateContextTokens(request)
 	inputLimit := contextInputLimit(request)
 	if estimatedTokens > inputLimit {
-		message := fmt.Sprintf("estimated context %d tokens exceeds input limit %d (context limit %d, reserve %d); compact or reset the session", estimatedTokens, inputLimit, contextLimit(), contextReserve())
+		message := fmt.Sprintf("estimated context %d tokens exceeds input limit %d (context limit %d, reserve %d); compact or reset the session", estimatedTokens, inputLimit, contextLimit(), effectiveContextReserve(request))
 		log.Printf("[warn] context exceeded: session=%s messages=%d estimated_tokens=%d limit=%d", externalSession, len(request.Messages), estimatedTokens, inputLimit)
 		writeError(w, http.StatusRequestEntityTooLarge, message, "context_exceeded")
 		return

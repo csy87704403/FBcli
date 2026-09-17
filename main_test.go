@@ -54,8 +54,8 @@ func TestGatewayModelListUsesGatewayBudgetMetadata(t *testing.T) {
 	if model["context_length"] != 10000 || model["x_freebuff_context_reserve"] != 500 {
 		t.Fatalf("model budget metadata = %#v", model)
 	}
-	if _, found := model["max_tokens"]; found {
-		t.Fatal("gateway reserve was advertised as upstream max_tokens")
+	if model["max_tokens"] != 2500 {
+		t.Fatal("advertised output budget must follow the gateway context cap")
 	}
 }
 
