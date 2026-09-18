@@ -25,7 +25,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"unicode/utf8"
+	"unicode"
 )
 
 const (
@@ -56,8 +56,9 @@ const (
 // response (notably V4 Flash) never makes clients forget that model exists.
 // The official session admission remains the authority for each actual chat.
 var (
-	catalogMu     sync.RWMutex
-	gatewayModels = []string{
+	catalogMu           sync.RWMutex
+	catalogDisplayNames = map[string]string{}
+	gatewayModels       = []string{
 		deepSeekProModel,
 		defaultModel,
 		gptLunaModel,
@@ -93,14 +94,17 @@ func loadHeadlessCatalog(cliPath string) error {
 		return fmt.Errorf("execute headless --catalog: %w", err)
 	}
 	var models []string
+	var displayNames map[string]string
 	if err := json.Unmarshal(output, &models); err != nil {
 		var obj struct {
-			Models []string `json:"models"`
+			Models       []string          `json:"models"`
+			DisplayNames map[string]string `json:"display_names"`
 		}
 		if err2 := json.Unmarshal(output, &obj); err2 != nil || len(obj.Models) == 0 {
 			return fmt.Errorf("parse headless catalog output: %w", err)
 		}
 		models = obj.Models
+		displayNames = obj.DisplayNames
 	}
 	if len(models) == 0 {
 		return errors.New("headless catalog returned empty model list")
@@ -125,6 +129,7 @@ func loadHeadlessCatalog(cliPath string) error {
 	}
 	catalogMu.Lock()
 	gatewayModels = models
+	catalogDisplayNames = displayNames
 	catalogMu.Unlock()
 	return nil
 }
@@ -136,11 +141,15 @@ func gatewayModelList() []map[string]any {
 	for _, model := range gatewayModels {
 		models = append(models, map[string]any{
 			"id": model, "object": "model", "owned_by": "freebuff-cli",
+			"display_name":         catalogDisplayNames[model],
 			"x_freebuff_admission": "official",
 			// These are gateway safeguards, not claims about the upstream model's
 			// native context window or output limit.
 			"context_length":             contextLimit(),
 			"max_tokens":                 contextLimit() / 4,
+			"input_limit_estimate":       contextInputLimit(chatRequest{}),
+			"input_limit_at_max_tokens":  contextLimit() - contextLimit()/4,
+			"x_freebuff_token_estimator": "mixed-text-v1 (approximate)",
 			"x_freebuff_context_reserve": contextReserve(),
 			"capabilities":               []string{"chat", "tools", "streaming"},
 		})
@@ -1053,23 +1062,36 @@ func contextReserve() int {
 	return defaultContextReserve
 }
 
-// estimateContextTokens intentionally errs high enough to protect the runtime
-// when callers omit tokenizer metadata. JSON size captures tool schemas and
-// tool results, which plain text-only estimates would miss.
+// Approximate admission accounting, not provider usage. Keep schemas separate
+// so ASCII-heavy tool definitions are not charged one token per character.
+func estimateTextTokens(data []byte, asciiWeight int) int {
+	units := 0
+	for _, r := range string(data) {
+		switch {
+		case r < 128:
+			units += asciiWeight
+		case unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana, unicode.Hangul):
+			units += 70
+		default:
+			units += 100
+		}
+	}
+	return (units + 99) / 100
+}
+
+func contextTokenParts(request chatRequest) (messages, tools int) {
+	data, _ := json.Marshal(request.Messages)
+	messages = estimateTextTokens(data, 28)
+	if len(request.Tools) > 0 {
+		data, _ = json.Marshal(request.Tools)
+		tools = estimateTextTokens(data, 25)
+	}
+	return
+}
+
 func estimateContextTokens(request chatRequest) int {
-	data, _ := json.Marshal(struct {
-		Messages []chatMessage `json:"messages"`
-		Tools    []openAITool  `json:"tools,omitempty"`
-	}{request.Messages, request.Tools})
-	if len(data) == 0 {
-		return 0
-	}
-	byByte := (len(data) + 3) / 4
-	byRune := utf8.RuneCount(data)
-	if byRune > byByte {
-		return byRune
-	}
-	return byByte
+	messages, tools := contextTokenParts(request)
+	return messages + tools
 }
 
 // This caps admission budgeting only; it does not enforce CLI output length.
@@ -2043,7 +2065,15 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if estimatedTokens > inputLimit {
 		message := fmt.Sprintf("estimated context %d tokens exceeds input limit %d (context limit %d, reserve %d); compact or reset the session", estimatedTokens, inputLimit, contextLimit(), effectiveContextReserve(request))
 		log.Printf("[warn] context exceeded: session=%s messages=%d estimated_tokens=%d limit=%d", externalSession, len(request.Messages), estimatedTokens, inputLimit)
-		writeError(w, http.StatusRequestEntityTooLarge, message, "context_exceeded")
+		messageTokens, toolTokens := contextTokenParts(request)
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": map[string]any{
+			"message": message, "type": "context_exceeded",
+			"estimated_input_tokens": estimatedTokens, "input_limit": inputLimit,
+			"must_reduce_by":           estimatedTokens - inputLimit,
+			"messages_tokens_estimate": messageTokens, "tools_tokens_estimate": toolTokens,
+			"context_limit": contextLimit(), "output_reserve": effectiveContextReserve(request),
+			"estimation_method": "mixed-text-v1", "approximate": true,
+		}})
 		return
 	}
 	if externalSession != "" {

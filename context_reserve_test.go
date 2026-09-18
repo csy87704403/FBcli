@@ -31,7 +31,7 @@ func TestHeavyAgentContextAdmission(t *testing.T) {
 	t.Setenv("FREEBUFF_CONTEXT_LIMIT", "131072")
 	t.Setenv("FREEBUFF_CONTEXT_RESERVE", "8192")
 	s, _ := newTestServerWithChild(t)
-	for _, tc := range []struct{ chars, status int }{{72520, 200}, {100000, 413}} {
+	for _, tc := range []struct{ chars, status int }{{72520, 200}, {134561, 200}, {400000, 413}} {
 		req := chatRequest{
 			Model: defaultModel, MaxTokens: 65536,
 			Messages: []chatMessage{

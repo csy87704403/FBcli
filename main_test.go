@@ -68,8 +68,8 @@ func TestEstimateContextTokensIncludesTools(t *testing.T) {
 
 func TestEstimateContextTokensProtectsNonASCII(t *testing.T) {
 	request := chatRequest{Messages: []chatMessage{{Role: "user", Content: strings.Repeat("中", 400)}}}
-	if got := estimateContextTokens(request); got < 400 {
-		t.Fatalf("non-ASCII estimate = %d, want at least rune count", got)
+	if got := estimateContextTokens(request); got < 280 || got > 310 {
+		t.Fatalf("CJK estimate = %d, want approximately 0.7 tokens per character plus framing", got)
 	}
 }
 
