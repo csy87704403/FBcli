@@ -4,7 +4,7 @@ import {
   FREEBUFF_CLI_BASE3_AGENT_ID_BY_MODEL,
   getFreebuffBase3RootAgentIdForModel,
 } from '@codebuff/common/constants/free-agents'
-import { DEFAULT_FREEBUFF_MODEL_ID, FREEBUFF_MODELS } from '@codebuff/common/constants/freebuff-models'
+import { DEFAULT_FREEBUFF_MODEL_ID } from '@codebuff/common/constants/freebuff-models'
 import { publishedTools, toolNames } from '@codebuff/common/tools/constants'
 import {
   CodebuffClient,
@@ -24,10 +24,9 @@ import {
 
 if (process.argv.includes('--catalog')) {
   const catalog: string[] = []
-  for (const option of FREEBUFF_MODELS) {
-    const agentId = FREEBUFF_CLI_BASE3_AGENT_ID_BY_MODEL[option.id]
-    if (agentId && bundledAgents[agentId]) {
-      catalog.push(option.id)
+  for (const [model, agentId] of Object.entries(FREEBUFF_CLI_BASE3_AGENT_ID_BY_MODEL)) {
+    if (bundledAgents[agentId]) {
+      catalog.push(model)
     }
   }
   let selected = catalog
@@ -52,8 +51,7 @@ if (process.argv.includes('--catalog')) {
     process.stderr.write(`allowlist excludes default model ${configuredDefault}\n`)
     process.exit(1)
   }
-  const displayNames = Object.fromEntries(FREEBUFF_MODELS.filter((m) => selected.includes(m.id)).map((m) => [m.id, m.displayName]))
-  process.stdout.write(`${JSON.stringify({ models: selected, display_names: displayNames })}\n`)
+  process.stdout.write(`${JSON.stringify(selected)}\n`)
   process.exit(0)
 }
 
